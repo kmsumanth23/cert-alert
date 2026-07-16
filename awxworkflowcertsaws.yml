@@ -110,9 +110,14 @@
     digest_node:
       identifier: node-digest-report
       all_parents_must_converge: true
-      # ADJUST: shared-services inventory the digest job template runs
-      # against (needs SMTP reachability from its host/EE).
+      # CREATION-ONLY TEST PREREQ #3: this inventory must already exist in
+      # AWX or creating this node fails. Verify the name, or override via
+      # acm_digest_inventory. (Also needs SMTP reachability, for later runs.)
       inventory: "{{ acm_digest_inventory | default('inventory_client_hxss_awsgss') }}"
+      # CREATION-ONLY TEST PREREQ #1: AWX resolves this job template BY NAME
+      # at workflow-creation time — create the 'ACM Certs Digest Report' JT
+      # first (a stub pointing at any playbook is enough for the creation
+      # test), or node creation fails and leaves a half-built workflow.
       unified_job_template:
         name: 'ACM Certs Digest Report'
         type: 'job_template'
@@ -130,7 +135,11 @@
 - name: Prepare consolidated AWS certs workflow template
   set_fact:
     awx_workflow_certs_aws:
-      - name: "renew certs - aws - all clients"
+      # CREATION-ONLY TEST #4: TEST-prefixed name so the eventual production
+      # workflow gets a clean create instead of updating this test object,
+      # and nobody mistakes it for a live workflow. For production: rename to
+      # "renew certs - aws - all clients" and delete the TEST workflow in AWX.
+      - name: "TEST renew certs - aws - all clients"
         organization: "{{ default_support_org }}"
         ask_inventory_on_launch: false
         ask_scm_branch_on_launch: false
@@ -141,7 +150,10 @@
           Driven by var refresh_certs in aws-client-vars-env.yml.
           Scheduled daily.
         workflow_nodes: "{{ aws_cert_workflow_nodes }}"
-        schedule: ["Runs daily certs"]
+        # CREATION-ONLY TEST #2: schedule key held back so nothing fires
+        # automatically, even if awx-create-workflow.yml reads job.schedule
+        # itself. For production: restore the line below AND Step 6.
+        # schedule: ["Runs daily certs"]
         allow_simultaneous: false
   when: aws_cert_workflow_nodes | length > 1
 
@@ -158,13 +170,16 @@
     - awx_workflow_certs_aws | length > 0
 
 # Step 6 — Schedule it
-- name: Schedule consolidated AWS certs workflow
-  include_tasks:
-    file: awx-create-schedule.yml
-  loop: "{{ awx_workflow_certs_aws | list }}"
-  loop_control:
-    loop_var: job
-    label: "{{ job.name }}"
-  when:
-    - awx_workflow_certs_aws is defined
-    - awx_workflow_certs_aws | length > 0
+# CREATION-ONLY TEST: whole step held back — the test only verifies the
+# workflow object is built correctly; nothing should run on a schedule.
+# For production: uncomment this block and restore the schedule key in Step 4.
+# - name: Schedule consolidated AWS certs workflow
+#   include_tasks:
+#     file: awx-create-schedule.yml
+#   loop: "{{ awx_workflow_certs_aws | list }}"
+#   loop_control:
+#     loop_var: job
+#     label: "{{ job.name }}"
+#   when:
+#     - awx_workflow_certs_aws is defined
+#     - awx_workflow_certs_aws | length > 0
