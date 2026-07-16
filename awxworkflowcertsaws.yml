@@ -1,0 +1,170 @@
+---
+# gcp-shared-services/playbooks/awx/kube/awx-workflow-certs-aws.yml
+#
+# Builds ONE consolidated AWS cert-renewal workflow (replaces the
+# per-client AWS workflows produced by awx-workflow-certs.yml; the GCP
+# path of that file is untouched and still runs per client).
+#
+# Topology (the "grouped by client" shape):
+#
+#   [hxsa-np] -> [hxsa-prd] ----------.
+#   [mosa-np] -> [mosa-prd] ----------+--> [ACM Certs Digest Report]
+#   [hxco-np] ------------------------'         (converge: ALL)
+#
+#   - one branch per client; a client's envs run SEQUENTIALLY,
+#     chained with always_nodes (preserves today's per-client
+#     serialization — no two envs hit the same client concurrently)
+#   - clients run in PARALLEL as independent branches
+#   - every client's LAST env node always-links to the digest node
+#   - digest node has all_parents_must_converge: true, so it waits
+#     for every branch and runs even when branches fail
+#
+# Discovery: every clients/<client>/<env>/aws-client-vars-env.yml in
+# the config repo with refresh_certs: true. The SAME discovery result
+# feeds both the workflow nodes and the digest node's expected_reports
+# manifest, so they can never drift apart.
+#
+# IMPORTANT: include this file ONCE per generator run (it discovers all
+# clients itself) — NOT inside the per-client loop that includes
+# awx-workflow-certs.yml.
+
+- name: Reset AWS consolidated cert workflow facts
+  set_fact:
+    aws_cert_envs: []
+    aws_cert_workflow_nodes: []
+    awx_workflow_certs_aws: []
+
+# Step 1 — Discover every AWS client-env opted into cert renewal
+- name: Discover AWS client environments with refresh_certs enabled
+  set_fact:
+    aws_cert_envs: "{{ aws_cert_envs + [env_entry] }}"
+  with_community.general.filetree: "{{ hclnow_config_client_env }}"
+  loop_control:
+    loop_var: env
+    label: "{{ env.path }} <{{ env.state }}>"
+  when:
+    - env.state == "directory"
+    - env.path.split('/') | length == 2
+    - aws_env_file is exists
+    - refresh_cert
+  vars:
+    awx_client_code: "{{ env.path.split('/')[0] }}"
+    awx_client_env: "{{ env.path.split('/')[1] }}"
+    aws_env_file: "{{ hclnow_config_client_env }}/{{ env.path }}/aws-client-vars-env.yml"
+    default_path: "{{ hclnow_config_client_env }}/{{ awx_client_code }}/aws-client-vars.yml"
+
+    # Same custom-delimiter template trick as awx-workflow-certs.yml so
+    # regular {{ }} vars inside the client files pass through unrendered.
+    env_file_vars: "{{ lookup('template', aws_env_file, errors='ignore', variable_start_string='[%', variable_end_string='%]') | from_yaml | default({}, true) }}"
+    refresh_cert: "{{ env_file_vars.refresh_certs | default(false) }}"
+    awx_infra_code: "{{ env_file_vars.client_infra_type | default((lookup('template', default_path, errors='ignore') | from_yaml | default({}, true)).client_infra_type | default(none)) }}"
+
+    env_entry:
+      client: "{{ awx_client_code }}"
+      env: "{{ awx_client_env }}"
+      infra_code: "{{ awx_infra_code }}"
+
+- name: Print discovered AWS cert client-envs
+  debug:
+    msg: "{{ aws_cert_envs }}"
+
+# Step 2 — Build per-client chained nodes, all converging on the digest node.
+# Node identifier: node-<client>-<env>. Within a client, each env node
+# always-links to the next env; the last env always-links to node-digest-report.
+- name: Build per-client chained workflow nodes
+  set_fact:
+    aws_cert_workflow_nodes: >-
+      {%- set nodes = [] -%}
+      {%- set tickets = awx_renew_certs_tickets | default({}) -%}
+      {%- for client, envs in aws_cert_envs | sort(attribute='client') | groupby('client') -%}
+      {%-   set env_list = envs | sort(attribute='env') -%}
+      {%-   for e in env_list -%}
+      {%-     if loop.last -%}
+      {%-       set next_ident = 'node-digest-report' -%}
+      {%-     else -%}
+      {%-       set next_ident = 'node-' ~ e.client ~ '-' ~ env_list[loop.index].env -%}
+      {%-     endif -%}
+      {%-     set _ = nodes.append({
+                'identifier': 'node-' ~ e.client ~ '-' ~ e.env,
+                'inventory': 'inventory_client_' ~ e.client ~ '_' ~ e.env,
+                'unified_job_template': {'name': 'Import Certificate to ACM in AWS', 'type': 'job_template'},
+                'extra_data': {
+                  'prod_ticket': tickets.get(e.client, {}).get(e.infra_code, ''),
+                  'infra_code': e.infra_code,
+                  'now_cloud': 'aws'
+                },
+                'related': {'always_nodes': [next_ident]}
+              }) -%}
+      {%-   endfor -%}
+      {%- endfor -%}
+      {{ nodes }}
+  when: aws_cert_envs | length > 0
+
+# Step 3 — Append the digest convergence node.
+# extra_data.expected_reports is the manifest the digest playbook uses to
+# detect branches that died before publishing an artifact.
+- name: Append digest report convergence node
+  set_fact:
+    aws_cert_workflow_nodes: "{{ aws_cert_workflow_nodes + [digest_node] }}"
+  vars:
+    digest_node:
+      identifier: node-digest-report
+      all_parents_must_converge: true
+      # ADJUST: shared-services inventory the digest job template runs
+      # against (needs SMTP reachability from its host/EE).
+      inventory: "{{ acm_digest_inventory | default('inventory_client_hxss_awsgss') }}"
+      unified_job_template:
+        name: 'ACM Certs Digest Report'
+        type: 'job_template'
+      extra_data:
+        expected_reports: "{{ aws_cert_envs }}"
+  when: aws_cert_envs | length > 0
+
+- name: Print consolidated workflow nodes
+  debug:
+    msg: "{{ aws_cert_workflow_nodes }}"
+  when: aws_cert_workflow_nodes | length > 0
+
+# Step 4 — Build the single workflow object (same schema the per-client
+# generator feeds into awx-create-workflow.yml / awx-create-schedule.yml).
+- name: Prepare consolidated AWS certs workflow template
+  set_fact:
+    awx_workflow_certs_aws:
+      - name: "renew certs - aws - all clients"
+        organization: "{{ default_support_org }}"
+        ask_inventory_on_launch: false
+        ask_scm_branch_on_launch: false
+        state: present
+        description: >-
+          Consolidated AWS cert renewal across all clients. One branch per
+          client (envs sequential), converging on a single digest email.
+          Driven by var refresh_certs in aws-client-vars-env.yml.
+          Scheduled daily.
+        workflow_nodes: "{{ aws_cert_workflow_nodes }}"
+        schedule: ["Runs daily certs"]
+        allow_simultaneous: false
+  when: aws_cert_workflow_nodes | length > 1
+
+# Step 5 — Create the workflow in AWX
+- name: Create consolidated AWS certs workflow
+  include_tasks:
+    file: awx-create-workflow.yml
+  loop: "{{ awx_workflow_certs_aws | list }}"
+  loop_control:
+    loop_var: job
+    label: "{{ job.name }}"
+  when:
+    - awx_workflow_certs_aws is defined
+    - awx_workflow_certs_aws | length > 0
+
+# Step 6 — Schedule it
+- name: Schedule consolidated AWS certs workflow
+  include_tasks:
+    file: awx-create-schedule.yml
+  loop: "{{ awx_workflow_certs_aws | list }}"
+  loop_control:
+    loop_var: job
+    label: "{{ job.name }}"
+  when:
+    - awx_workflow_certs_aws is defined
+    - awx_workflow_certs_aws | length > 0

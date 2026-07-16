@@ -1,0 +1,493 @@
+---
+# aws-v9-automation/tasks/aws-cert-import.yml
+#
+# CHANGES vs previous version (consolidated-digest redesign):
+#   1. Per-cert emails for 'renewed' and 'expiring_soon' are REMOVED.
+#      Those now appear only in the consolidated digest (see acm-cert-digest.yml).
+#   2. Immediate individual emails are KEPT for hard failures that need
+#      manual intervention: chain_verify_failed and import_failed.
+#   3. New tasks at the end publish a sanitized per-client report via
+#      set_stats so the workflow's digest node can aggregate all clients.
+
+- name: Get authentication session details
+  sts_assume_role:
+    role_arn: "{{ arn_auto_admin_val }}"
+    role_session_name: operstssess0
+    aws_access_key: "{{ access_val }}"
+    aws_secret_key: "{{ sec_val }}"
+    duration_seconds: 3600
+    aws_region: "{{ aws_region }}"
+  register: assumed_role
+  delegate_to: localhost
+  tags:
+    - certs
+
+- name: Print assumed_role details
+  debug:
+    msg: "{{ assumed_role.sts_creds }}"
+  tags:
+    - debug
+    - never
+
+- name: Set AWS STS credentials
+  set_fact:
+    aws_access_key: "{{ assumed_role.sts_creds.access_key }}"
+    aws_secret_key: "{{ assumed_role.sts_creds.secret_key }}"
+    aws_session_token: "{{ assumed_role.sts_creds.session_token }}"
+  tags:
+    - certs
+
+- name: Set python3 interpreter
+  set_fact:
+    ansible_python_interpreter: /usr/bin/python3
+  tags:
+    - certs
+
+- name: install boto3 and botocore
+  include_tasks: vsi-install-boto.yml
+  tags:
+    - certs
+
+- name: Get current timestamp
+  set_fact:
+    current_epoch: "{{ ansible_date_time.epoch | int }}"
+  tags:
+    - certs
+
+- name: Get ACM Certificate Details
+  community.aws.acm_certificate_info:
+    domain_name: "{{ item.domain_name }}"
+    region: "{{ aws_region }}"
+  loop: "{{ certificates }}"
+  loop_control:
+    label: "{{ item.domain_name }}"
+  register: cert_facts
+  delegate_to: localhost
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+    AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+    AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+  tags:
+    - certs
+
+- name: Define renewal threshold (in days)
+  set_fact:
+    renewal_days_threshold: "{{ client_cert_expiry_notice }}"
+  tags:
+    - certs
+
+- name: Build certificate information dictionary
+  set_fact:
+    certs_info: "{{ certs_info | default({}) | combine({ item.item.domain_name: cert_details }) }}"
+  loop: "{{ cert_facts.results }}"
+  loop_control:
+    label: "{{ item.item.domain_name }}"
+  when: item.certificates | length > 0
+  vars:
+    cert_details:
+      cert_arn: "{{ item.certificates[0].certificate_arn }}"
+      not_after: "{{ item.certificates[0].not_after }}"
+      expire_ts: "{{ (item.certificates[0].not_after | to_datetime('%Y-%m-%dT%H:%M:%S%z')).timestamp() | int }}"
+      # Adding 11 hours (39600 seconds) for your adjustment
+      adjusted_expire_ts: "{{ ((item.certificates[0].not_after | to_datetime('%Y-%m-%dT%H:%M:%S%z')).timestamp() | int) + 39600 }}"
+      current_ts: "{{ ansible_facts.date_time.epoch | int }}"
+      # Check if (expiry_date + 11 hours - renewal_threshold) is in the past
+      renewal_due: "{{ (((item.certificates[0].not_after | to_datetime('%Y-%m-%dT%H:%M:%S%z')).timestamp() | int) + 39600 - (renewal_days_threshold | int * 86400)) < (ansible_facts.date_time.epoch | int) }}"
+      secret_name: "{{ item.item.secret_name }}"
+      secret_namespace: "{{ item.item.secret_namespace }}"
+  tags:
+    - certs
+
+- name: Get Kubernetes certificate secret
+  shell: kubectl get secret {{ certs_info[item].secret_name }} -n {{ certs_info[item].secret_namespace }} -o jsonpath='{.data.tls\.key} {.data.tls\.crt}'
+  register: secret_raw
+  no_log: true
+  become: yes
+  become_user: root
+  become_method: su
+  become_exe: sudo su -
+  loop: "{{ certs_info.keys() | list }}"
+  loop_control:
+    loop_var: item
+  when: certs_info[item].renewal_due
+  tags:
+    - certs
+
+- name: Decode TLS key and certificate
+  set_fact:
+    certs_info: "{{ certs_info | combine({ item: certs_info[item] | combine({
+      'decoded_key': (secret_raw.results[loop_index].stdout.split(' ')[0] | b64decode),
+      'decoded_crt': (secret_raw.results[loop_index].stdout.split(' ')[1] | b64decode)
+    }) }) }}"
+  no_log: true
+  loop: "{{ certs_info.keys() | list }}"
+  loop_control:
+    loop_var: item
+    index_var: loop_index
+  when: certs_info[item].renewal_due
+  tags:
+    - certs
+
+- name: Extract primary and intermediate certificates
+  set_fact:
+    certs_info: "{{ certs_info | combine({ item: certs_info[item] | combine({
+      'primary_cert': (cert_parts[0] + '-----END CERTIFICATE-----'),
+      'intermediate_cert': (
+        (cert_parts[1:-1] | join('-----END CERTIFICATE-----') + '-----END CERTIFICATE-----')
+        if (cert_parts[1:-1] | length > 0)
+        else ''
+      ),
+      'chain_cert_count': ((cert_parts | length) - 1)
+    }) }) }}"
+  no_log: true
+  vars:
+    cert_parts: "{{ certs_info[item].decoded_crt.split('-----END CERTIFICATE-----') }}"
+  loop: "{{ certs_info.keys() | list }}"
+  loop_control:
+    loop_var: item
+  when: certs_info[item].renewal_due
+  tags:
+    - certs
+
+# Flags chains outside 2–3 certs (LE Gen Y may return 3: leaf + intermediate + cross-signed root).
+- name: Warn if certificate chain length is outside expected range
+  debug:
+    msg: >-
+      WARNING: {{ item }} has {{ certs_info[item].chain_cert_count }} cert(s)
+      in its chain (expected 2-3: leaf + 1-2 intermediates). Review the
+      decoded certificate before this is imported to ACM.
+  loop: "{{ certs_info.keys() | list }}"
+  loop_control:
+    loop_var: item
+  when:
+    - certs_info[item].renewal_due
+    - (certs_info[item].chain_cert_count | int) < 2 or (certs_info[item].chain_cert_count | int) > 3
+  tags:
+    - certs
+
+- name: Save decoded private key to a file
+  copy:
+    content: "{{ certs_info[item].decoded_key }}"
+    dest: "/data/private/{{ item }}-cert_key.key"
+    mode: '0400'
+    owner: root
+    group: root
+  no_log: true
+  loop: "{{ certs_info.keys() | list }}"
+  loop_control:
+    loop_var: item
+  when: certs_info[item].renewal_due
+  tags:
+    - certs
+
+- name: Remove private key from cert_info var
+  set_fact:
+    certs_info: "{{ certs_info | combine({ item: certs_info[item] | dict2items | rejectattr('key', 'equalto', 'decoded_key') | items2dict }) }}"
+  no_log: true
+  loop: "{{ certs_info.keys() | list }}"
+  loop_control:
+    loop_var: item
+  when: certs_info[item].renewal_due
+  tags:
+    - certs
+
+- name: Save primary certificate to a file
+  copy:
+    content: "{{ certs_info[item].primary_cert }}"
+    dest: "/data/private/{{ item }}-primary_cert.crt"
+    mode: '0644'
+    owner: root
+    group: root
+  loop: "{{ certs_info.keys() | list }}"
+  loop_control:
+    loop_var: item
+  when: certs_info[item].renewal_due
+  tags:
+    - certs
+
+- name: Save intermediate certificate to a file
+  copy:
+    content: "{{ certs_info[item].intermediate_cert }}"
+    dest: "/data/private/{{ item }}-intermediate_cert.crt"
+    mode: '0644'
+    owner: root
+    group: root
+  loop: "{{ certs_info.keys() | list }}"
+  loop_control:
+    loop_var: item
+  when:
+    - certs_info[item].renewal_due
+    - certs_info[item].intermediate_cert | length > 0
+  tags:
+    - certs
+
+# Verify the leaf chains to a trusted root via the saved intermediate(s) before pushing to ACM.
+# Guards against broken chains (e.g. LE Gen Y May 2026 incident: intermediates missing EKU fields).
+- name: Verify certificate chain locally before import
+  shell: >
+    openssl verify -untrusted /data/private/{{ item }}-intermediate_cert.crt
+    /data/private/{{ item }}-primary_cert.crt
+  register: chain_verify
+  loop: "{{ certs_info.keys() | list }}"
+  loop_control:
+    loop_var: item
+  when:
+    - certs_info[item].renewal_due
+    - certs_info[item].intermediate_cert | length > 0
+  failed_when: false
+  changed_when: false
+  tags:
+    - certs
+
+- name: Record chain verification result
+  set_fact:
+    certs_info: "{{ certs_info | combine({ item.item: certs_info[item.item] | combine({
+      'chain_verify_failed': (item.rc | default(0)) != 0,
+      'chain_verify_error': (item.stderr if (item.rc | default(0)) != 0 else None)
+    }) }) }}"
+  loop: "{{ chain_verify.results }}"
+  loop_control:
+    loop_var: item
+  when: item.item is defined
+  tags:
+    - certs
+
+# IMMEDIATE ALERT (kept): chain verification failures need manual review.
+- name: Notify on chain verification failure
+  mail:
+    host: "{{ smtp_server }}"
+    port: "{{ smtp_port }}"
+    username: "{{ smtp_auth_user }}"
+    password: "{{ smtp_auth_pswd }}"
+    sender: "{{ smtp_default_sender }}"
+    to: "{{ smtp_emails_certs }}"
+    cc: "{{ cloudops_group_emails }}"
+    subject: "Error!!! {{ item }} chain verification failed - ACM import skipped"
+    body: >-
+      Local OpenSSL chain verification failed for {{ item }} before ACM
+      import. The import has been skipped to avoid pushing a broken
+      certificate chain to ACM.
+
+      Error: {{ certs_info[item].chain_verify_error | default('unknown') }}
+
+      Please review /data/private/{{ item }}-primary_cert.crt and
+      /data/private/{{ item }}-intermediate_cert.crt manually.
+  loop: "{{ certs_info.keys() | list }}"
+  loop_control:
+    loop_var: item
+  when:
+    - certs_info[item].renewal_due
+    - certs_info[item].chain_verify_failed | default(false)
+  delegate_to: localhost
+  tags:
+    - certs
+
+- name: Import renewed certificate to ACM
+  shell: >
+    /usr/local/bin/aws acm import-certificate
+    --certificate-arn {{ certs_info[item].cert_arn }}
+    --certificate fileb:///data/private/{{ item }}-primary_cert.crt
+    --private-key fileb:///data/private/{{ item }}-cert_key.key
+    {% if certs_info[item].intermediate_cert | length > 0 %}
+    --certificate-chain fileb:///data/private/{{ item }}-intermediate_cert.crt
+    {% endif %}
+  register: import_result
+  become: yes
+  become_user: root
+  become_method: su
+  become_exe: sudo su -
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ assumed_role.sts_creds.access_key }}"
+    AWS_SECRET_ACCESS_KEY: "{{ assumed_role.sts_creds.secret_key }}"
+    AWS_SESSION_TOKEN: "{{ assumed_role.sts_creds.session_token }}"
+  loop: "{{ certs_info.keys() | list }}"
+  loop_control:
+    loop_var: item
+  when:
+    - certs_info[item].renewal_due
+    - not (certs_info[item].chain_verify_failed | default(false))
+  tags:
+    - certs
+
+- name: Set certificate status
+  set_fact:
+    certs_info: >-
+      {{ certs_info | combine({
+          item.item: certs_info[item.item] | combine({
+            'status': (
+              'renewed' if (item.rc is defined and item.rc == 0)
+              else 'import_failed' if (item.rc is defined and item.rc != 0)
+              else (certs_info[item.item].status | default('expiring_soon'))
+            ),
+            'import_error': (item.stderr if (item.rc is defined and item.rc != 0) else None)
+          })
+      }) }}
+  loop: "{{ import_result.results }}"
+  loop_control:
+    loop_var: item
+  when: item.item is defined
+  tags: certs
+
+# Certs that failed chain verification are skipped by the import task (gated on chain_verify_failed).
+# Set status explicitly here or they silently fall through to 'expiring_soon'.
+- name: Set status for certificates that failed chain verification
+  set_fact:
+    certs_info: "{{ certs_info | combine({ item: certs_info[item] | combine({
+      'status': 'chain_verify_failed'
+    }) }) }}"
+  loop: "{{ certs_info.keys() | list }}"
+  loop_control:
+    loop_var: item
+  when:
+    - certs_info[item].renewal_due
+    - certs_info[item].chain_verify_failed | default(false)
+  tags: certs
+
+- name: Mark certificates expiring soon
+  set_fact:
+    certs_info: >-
+      {{ certs_info | combine({
+          item.key: item.value | combine({
+            'status': (
+              item.value.status
+              if (item.value.status is defined and item.value.status in ['renewed', 'import_failed', 'chain_verify_failed'])
+              else 'expiring_soon'
+            )
+          })
+      }) }}
+  loop: "{{ certs_info | dict2items }}"
+  loop_control:
+    loop_var: item
+  when: ((item.value.expire_ts | int) - (ansible_date_time.epoch | int)) // 86400 <= client_cert_expiry_notice
+  tags: certs
+
+# IMMEDIATE ALERT (kept, narrowed): only import failures email immediately.
+# 'renewed' and 'expiring_soon' notifications moved to the consolidated
+# digest sent by the workflow's final node (acm-cert-digest.yml).
+- name: Notify immediately on import failure
+  mail:
+    host: "{{ smtp_server }}"
+    port: "{{ smtp_port }}"
+    username: "{{ smtp_auth_user }}"
+    password: "{{ smtp_auth_pswd }}"
+    sender: "{{ smtp_default_sender }}"
+    to: "{{ smtp_emails_certs }}"
+    cc: "{{ cloudops_group_emails }}"
+    subject: "Error!!! {{ item.key }} import failed"
+    body: "{{ lookup('template', 'manual_cert_mail_content.txt.j2') }}"
+  loop: "{{ certs_info | dict2items }}"
+  loop_control:
+    loop_var: item
+  when:
+    - item.value.status is defined
+    - item.value.status == 'import_failed'
+  delegate_to: localhost
+  tags:
+    - certs
+
+- name: Remove temporary private key file
+  file:
+    path: "/data/private/{{ item }}-cert_key.key"
+    state: absent
+  ignore_errors: true
+  loop: "{{ certs_info.keys() | list }}"
+  loop_control:
+    loop_var: item
+  when: certs_info[item].renewal_due
+  tags:
+    - certs
+
+- name: Remove temporary primary certificate file
+  file:
+    path: "/data/private/{{ item }}-primary_cert.crt"
+    state: absent
+  ignore_errors: true
+  loop: "{{ certs_info.keys() | list }}"
+  loop_control:
+    loop_var: item
+  when:
+    - certs_info[item].renewal_due
+    - not (certs_info[item].chain_verify_failed | default(false))
+  tags:
+    - certs
+
+- name: Remove temporary intermediate certificate file
+  file:
+    path: "/data/private/{{ item }}-intermediate_cert.crt"
+    state: absent
+  ignore_errors: true
+  loop: "{{ certs_info.keys() | list }}"
+  loop_control:
+    loop_var: item
+  when:
+    - certs_info[item].renewal_due
+    - certs_info[item].intermediate_cert | length > 0
+    - not (certs_info[item].chain_verify_failed | default(false))
+  tags:
+    - certs
+
+# ------------------------------------------------------------------
+# CONSOLIDATED DIGEST ARTIFACT (Requirement 1)
+#
+# Publishes a sanitized per-client report as an AWX workflow artifact.
+# The digest node (acm-cert-digest.yml) aggregates the artifacts from
+# every client branch of the consolidated workflow.
+#
+# SECURITY: the rows below are an explicit WHITELIST. certs_info still
+# carries decoded_crt / primary_cert / intermediate_cert PEM material
+# for renewal-due certs — never pass certs_info through as-is, because
+# set_stats artifacts land in the AWX database and job detail UI.
+# ------------------------------------------------------------------
+
+- name: Note configured domains with no matching certificate in ACM
+  set_fact:
+    acm_missing_domains: "{{ certificates | default([]) | map(attribute='domain_name') | difference(certs_info | default({}) | list) }}"
+  tags: certs
+
+- name: Build sanitized report rows for consolidated digest
+  set_fact:
+    acm_report_rows: "{{ acm_report_rows | default([]) + [report_row] }}"
+  loop: "{{ certs_info | default({}) | dict2items }}"
+  loop_control:
+    loop_var: cert
+    label: "{{ cert.key }}"
+  vars:
+    report_row:
+      domain: "{{ cert.key }}"
+      cert_arn: "{{ cert.value.cert_arn }}"
+      not_after: "{{ cert.value.not_after }}"
+      days_left: "{{ ((cert.value.expire_ts | int) - (ansible_date_time.epoch | int)) // 86400 }}"
+      status: "{{ cert.value.status | default('ok') }}"
+      error: "{{ (cert.value.import_error | default('', true)) or (cert.value.chain_verify_error | default('', true)) }}"
+  tags: certs
+
+- name: Add report rows for configured domains not found in ACM
+  set_fact:
+    acm_report_rows: "{{ acm_report_rows | default([]) + [missing_row] }}"
+  loop: "{{ acm_missing_domains | default([]) }}"
+  loop_control:
+    loop_var: missing_domain
+  vars:
+    missing_row:
+      domain: "{{ missing_domain }}"
+      cert_arn: ''
+      not_after: ''
+      days_left: ''
+      status: 'not_found_in_acm'
+      error: 'No certificate matched this domain in ACM'
+  tags: certs
+
+- name: Publish consolidated digest artifact
+  set_stats:
+    data: "{{ { acm_report_key: acm_report_payload } }}"
+    per_host: false
+    aggregate: true
+  vars:
+    acm_report_key: "acm_report_{{ client_code | regex_replace('[^A-Za-z0-9]', '_') }}_{{ client_env | regex_replace('[^A-Za-z0-9]', '_') }}"
+    acm_report_payload:
+      client: "{{ client_code }}"
+      env: "{{ client_env }}"
+      collected_at: "{{ ansible_date_time.iso8601 }}"
+      renewal_threshold_days: "{{ client_cert_expiry_notice }}"
+      certs: "{{ acm_report_rows | default([]) }}"
+  tags: certs

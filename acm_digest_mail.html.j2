@@ -1,0 +1,87 @@
+{# templates/acm_digest_mail.html.j2
+   Consolidated ACM certificate digest.
+   Expects: failed_rows, expiring_rows, renewed_rows, missing_reports,
+            digest_expiry_days, expected_reports, digest_certs
+   Inline styles only — email clients strip <style> blocks. #}
+{% macro cert_table(rows, accent) -%}
+<table cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;font-family:Arial,Helvetica,sans-serif;font-size:13px;margin-bottom:24px;">
+  <tr style="background:#f0f0f0;">
+    <th style="border:1px solid #d0d0d0;padding:6px 10px;text-align:left;">Client</th>
+    <th style="border:1px solid #d0d0d0;padding:6px 10px;text-align:left;">Env</th>
+    <th style="border:1px solid #d0d0d0;padding:6px 10px;text-align:left;">Domain</th>
+    <th style="border:1px solid #d0d0d0;padding:6px 10px;text-align:left;">Expiry (UTC)</th>
+    <th style="border:1px solid #d0d0d0;padding:6px 10px;text-align:right;">Days left</th>
+    <th style="border:1px solid #d0d0d0;padding:6px 10px;text-align:left;">Status</th>
+  </tr>
+{% for row in rows %}
+{% set days = (row.days_left | int) if (row.days_left | string | length) > 0 else none %}
+{% set row_bg = '#fdecea' if (accent == 'red' or (days is not none and days <= 7)) else ('#fff8e1' if accent == 'amber' else ('#eaf6ea' if accent == 'green' else '#ffffff')) %}
+  <tr style="background:{{ row_bg }};">
+    <td style="border:1px solid #d0d0d0;padding:6px 10px;">{{ row.client }}</td>
+    <td style="border:1px solid #d0d0d0;padding:6px 10px;">{{ row.env }}</td>
+    <td style="border:1px solid #d0d0d0;padding:6px 10px;">{{ row.domain }}</td>
+    <td style="border:1px solid #d0d0d0;padding:6px 10px;">{{ row.not_after | default('-', true) }}</td>
+    <td style="border:1px solid #d0d0d0;padding:6px 10px;text-align:right;{% if days is not none and days <= 7 %}color:#b71c1c;font-weight:bold;{% endif %}">{{ days if days is not none else '-' }}</td>
+    <td style="border:1px solid #d0d0d0;padding:6px 10px;">{{ row.status }}{% if row.error | default('', true) | length > 0 %}<br/><span style="color:#b71c1c;font-size:12px;">{{ row.error }}</span>{% endif %}</td>
+  </tr>
+{% endfor %}
+</table>
+{%- endmacro %}
+<div style="font-family:Arial,Helvetica,sans-serif;color:#222;max-width:900px;">
+  <h2 style="margin:0 0 4px 0;">ACM Certificate Digest &mdash; {{ '%Y-%m-%d' | strftime }}</h2>
+  <p style="margin:0 0 16px 0;color:#555;font-size:13px;">
+    Consolidated daily report across {{ expected_reports | length }} client environment(s)
+    &middot; {{ digest_certs | length }} certificate(s) scanned
+    &middot; expiry window: {{ digest_expiry_days }} days
+  </p>
+
+  <p style="font-size:14px;margin:0 0 20px 0;">
+    <span style="background:#fdecea;border:1px solid #f5c6c2;border-radius:4px;padding:3px 10px;margin-right:6px;">&#10060; Failed: <b>{{ failed_rows | length }}</b></span>
+    <span style="background:#fff8e1;border:1px solid #f0e0a0;border-radius:4px;padding:3px 10px;margin-right:6px;">&#9200; Expiring &le; {{ digest_expiry_days }}d: <b>{{ expiring_rows | length }}</b></span>
+    <span style="background:#eaf6ea;border:1px solid #bfdcbf;border-radius:4px;padding:3px 10px;margin-right:6px;">&#9989; Renewed: <b>{{ renewed_rows | length }}</b></span>
+    <span style="background:#ededed;border:1px solid #cccccc;border-radius:4px;padding:3px 10px;">&#10067; No report: <b>{{ missing_reports | length }}</b></span>
+  </p>
+
+{% if failed_rows | length > 0 %}
+  <h3 style="color:#b71c1c;margin:0 0 8px 0;">&#10060; Failures &mdash; manual action required</h3>
+  <p style="font-size:12px;color:#555;margin:0 0 8px 0;">Import failures and chain-verification failures also triggered immediate individual alerts.</p>
+  {{ cert_table(failed_rows, 'red') }}
+{% endif %}
+
+{% if expiring_rows | length > 0 %}
+  <h3 style="color:#8a6d00;margin:0 0 8px 0;">&#9200; Expiring within {{ digest_expiry_days }} days (not yet renewed)</h3>
+  {{ cert_table(expiring_rows | sort(attribute='days_left') , 'amber') }}
+{% endif %}
+
+{% if renewed_rows | length > 0 %}
+  <h3 style="color:#1b5e20;margin:0 0 8px 0;">&#9989; Renewed in this run</h3>
+  {{ cert_table(renewed_rows, 'green') }}
+{% endif %}
+
+{% if missing_reports | length > 0 %}
+  <h3 style="color:#b71c1c;margin:0 0 8px 0;">&#10067; Client environments with NO report</h3>
+  <p style="font-size:12px;color:#555;margin:0 0 8px 0;">
+    These branches finished without publishing a report (job failed or errored
+    before collection). Their certificates were NOT checked today &mdash; treat
+    as unknown, not healthy. Check the workflow job in AWX.
+  </p>
+  <table cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-family:Arial,Helvetica,sans-serif;font-size:13px;margin-bottom:24px;">
+    <tr style="background:#f0f0f0;">
+      <th style="border:1px solid #d0d0d0;padding:6px 10px;text-align:left;">Client</th>
+      <th style="border:1px solid #d0d0d0;padding:6px 10px;text-align:left;">Env</th>
+    </tr>
+{% for miss in missing_reports %}
+    <tr style="background:#fdecea;">
+      <td style="border:1px solid #d0d0d0;padding:6px 10px;">{{ miss.client }}</td>
+      <td style="border:1px solid #d0d0d0;padding:6px 10px;">{{ miss.env }}</td>
+    </tr>
+{% endfor %}
+  </table>
+{% endif %}
+
+  <p style="color:#888;font-size:11px;margin-top:24px;">
+    Generated by the consolidated AWS cert-renewal workflow (ACM Certs Digest Report node).
+    Healthy certificates outside the {{ digest_expiry_days }}-day window are not listed;
+    on fully healthy days no email is sent.
+  </p>
+</div>
