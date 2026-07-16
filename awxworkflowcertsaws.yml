@@ -53,11 +53,14 @@
     aws_env_file: "{{ hclnow_config_client_env }}/{{ env.path }}/aws-client-vars-env.yml"
     default_path: "{{ hclnow_config_client_env }}/{{ awx_client_code }}/aws-client-vars.yml"
 
-    # Same custom-delimiter template trick as awx-workflow-certs.yml so
-    # regular {{ }} vars inside the client files pass through unrendered.
+    # Custom-delimiter template trick (same as awx-workflow-certs.yml) on
+    # BOTH lookups so regular {{ }} vars inside the client files (e.g.
+    # {{ client_env_base }} in aws-client-vars.yml) pass through unrendered
+    # instead of raising 'undefined variable' during discovery.
     env_file_vars: "{{ lookup('template', aws_env_file, errors='ignore', variable_start_string='[%', variable_end_string='%]') | from_yaml | default({}, true) }}"
+    default_file_vars: "{{ lookup('template', default_path, errors='ignore', variable_start_string='[%', variable_end_string='%]') | from_yaml | default({}, true) }}"
     refresh_cert: "{{ env_file_vars.refresh_certs | default(false) }}"
-    awx_infra_code: "{{ env_file_vars.client_infra_type | default((lookup('template', default_path, errors='ignore') | from_yaml | default({}, true)).client_infra_type | default(none)) }}"
+    awx_infra_code: "{{ env_file_vars.client_infra_type | default(default_file_vars.client_infra_type | default(none)) }}"
 
     env_entry:
       client: "{{ awx_client_code }}"
