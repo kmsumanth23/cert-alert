@@ -115,10 +115,13 @@
 
 - name: Decode TLS key and certificate
   set_fact:
-    certs_info: "{{ certs_info | combine({ item: certs_info[item] | combine({
-      'decoded_key': (secret_raw.results[loop_index].stdout.split(' ')[0] | b64decode),
-      'decoded_crt': (secret_raw.results[loop_index].stdout.split(' ')[1] | b64decode)
-    }) }) }}"
+    certs_info: >-
+      {{ certs_info | combine({
+          item: certs_info[item] | combine({
+            'decoded_key': (secret_raw.results[loop_index].stdout.split(' ')[0] | b64decode),
+            'decoded_crt': (secret_raw.results[loop_index].stdout.split(' ')[1] | b64decode)
+          })
+      }) }}
   no_log: true
   loop: "{{ certs_info.keys() | list }}"
   loop_control:
@@ -130,15 +133,18 @@
 
 - name: Extract primary and intermediate certificates
   set_fact:
-    certs_info: "{{ certs_info | combine({ item: certs_info[item] | combine({
-      'primary_cert': (cert_parts[0] + '-----END CERTIFICATE-----'),
-      'intermediate_cert': (
-        (cert_parts[1:-1] | join('-----END CERTIFICATE-----') + '-----END CERTIFICATE-----')
-        if (cert_parts[1:-1] | length > 0)
-        else ''
-      ),
-      'chain_cert_count': ((cert_parts | length) - 1)
-    }) }) }}"
+    certs_info: >-
+      {{ certs_info | combine({
+          item: certs_info[item] | combine({
+            'primary_cert': (cert_parts[0] + '-----END CERTIFICATE-----'),
+            'intermediate_cert': (
+              (cert_parts[1:-1] | join('-----END CERTIFICATE-----') + '-----END CERTIFICATE-----')
+              if (cert_parts[1:-1] | length > 0)
+              else ''
+            ),
+            'chain_cert_count': ((cert_parts | length) - 1)
+          })
+      }) }}
   no_log: true
   vars:
     cert_parts: "{{ certs_info[item].decoded_crt.split('-----END CERTIFICATE-----') }}"
@@ -241,10 +247,13 @@
 
 - name: Record chain verification result
   set_fact:
-    certs_info: "{{ certs_info | combine({ item.item: certs_info[item.item] | combine({
-      'chain_verify_failed': (item.rc | default(0)) != 0,
-      'chain_verify_error': (item.stderr if (item.rc | default(0)) != 0 else None)
-    }) }) }}"
+    certs_info: >-
+      {{ certs_info | combine({
+          item.item: certs_info[item.item] | combine({
+            'chain_verify_failed': (item.rc | default(0)) != 0,
+            'chain_verify_error': (item.stderr if (item.rc | default(0)) != 0 else None)
+          })
+      }) }}
   loop: "{{ chain_verify.results }}"
   loop_control:
     loop_var: item
@@ -332,9 +341,12 @@
 # Set status explicitly here or they silently fall through to 'expiring_soon'.
 - name: Set status for certificates that failed chain verification
   set_fact:
-    certs_info: "{{ certs_info | combine({ item: certs_info[item] | combine({
-      'status': 'chain_verify_failed'
-    }) }) }}"
+    certs_info: >-
+      {{ certs_info | combine({
+          item: certs_info[item] | combine({
+            'status': 'chain_verify_failed'
+          })
+      }) }}
   loop: "{{ certs_info.keys() | list }}"
   loop_control:
     loop_var: item
