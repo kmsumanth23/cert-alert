@@ -17,10 +17,15 @@
 # certs expiring within digest_expiry_days, renewed today, failed,
 # or client-envs that produced no report. All-healthy days send nothing.
 
+# EXECUTION MODEL: runs on the implicit localhost of the execution
+# environment — the same place the cert jobs' mail tasks already run
+# (delegate_to: localhost), so SMTP reachability is proven. The job
+# template's inventory contents are irrelevant; it just has to exist.
+# IMPORTANT: the job template's Limit field MUST be empty — a limit like
+# 'bastion*' filters out localhost and fails with "does not match any hosts".
 - name: ACM certificate consolidated digest
-  hosts: all
+  hosts: localhost
   gather_facts: false
-  run_once: true
   vars_files:
     # ADJUST PATH if needed: same vars file the cert playbook loads for
     # smtp_server / smtp_port / smtp_auth_* / smtp_default_sender /
@@ -40,7 +45,6 @@
           expected_reports was not passed via the workflow node's extra_data.
           The digest cannot distinguish 'healthy' from 'never reported'
           without it — check the generated workflow node configuration.
-      run_once: true
 
     - name: Initialise digest buckets
       set_fact:
@@ -118,4 +122,3 @@
             if missing_reports | length > 0 else ''
           }}
         body: "{{ lookup('template', 'templates/acm_digest_mail.html.j2') }}"
-      delegate_to: localhost
