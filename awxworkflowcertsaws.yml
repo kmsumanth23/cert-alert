@@ -122,9 +122,11 @@
     digest_node:
       identifier: node-digest-report
       all_parents_must_converge: true
-      # CREATION-ONLY TEST PREREQ #3: this inventory must already exist in
-      # AWX or creating this node fails. Verify the name, or override via
-      # acm_digest_inventory. (Also needs SMTP reachability, for later runs.)
+      # This inventory must EXIST in AWX (node creation resolves it by name)
+      # but its CONTENTS are irrelevant: acm-cert-digest.yml targets implicit
+      # localhost on the EE, so no client hosts are touched. Any existing
+      # inventory works; override via acm_digest_inventory if the default
+      # name is absent on your tower. Keep the digest JT's Limit field EMPTY.
       inventory: "{{ acm_digest_inventory | default('inventory_client_hxss_awsgss') }}"
       # CREATION-ONLY TEST PREREQ #1: AWX resolves this job template BY NAME
       # at workflow-creation time — create the 'ACM Certs Digest Report' JT
