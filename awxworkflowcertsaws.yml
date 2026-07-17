@@ -47,6 +47,15 @@
     - env.path.split('/') | length == 2
     - aws_env_file is exists
     - refresh_cert
+    # CREATION-ONLY TEST: optional whitelist of 'client/env' strings, passed
+    # as an extra var. On a test tower where most client inventories don't
+    # exist, node creation fails for every missing inventory, the play aborts
+    # BEFORE the link-creation pass, and the workflow is left linkless.
+    # Filtering at discovery keeps nodes, chain links, and the digest's
+    # expected_reports manifest consistent with each other.
+    # Example: -e '{"acm_cert_env_whitelist": ["hxtx/np", "hxsa/awsv9m"]}'
+    # Leave UNDEFINED in production to include everything.
+    - (acm_cert_env_whitelist is not defined) or (env.path in acm_cert_env_whitelist)
   vars:
     awx_client_code: "{{ env.path.split('/')[0] }}"
     awx_client_env: "{{ env.path.split('/')[1] }}"
