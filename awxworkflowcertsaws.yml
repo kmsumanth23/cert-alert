@@ -169,6 +169,27 @@
         allow_simultaneous: false
   when: aws_cert_workflow_nodes | length > 1
 
+# Step 4b — CREATION-ONLY TEST: optional pre-delete of the TEST workflow.
+# A half-built workflow (nodes without links, from an aborted earlier run)
+# is safest rebuilt from scratch: recreating nodes that already exist
+# reports 'ok' (not 'changed'), and the relation pass may skip unchanged
+# nodes — leaving links missing. Deleting first forces a full clean build.
+# Run with extra var:  acm_test_workflow_delete: true   (default: off)
+#
+# NOTE: copy the module name and auth parameters (tower_host/tower_username/
+# tower_password or equivalent) EXACTLY from the 'create the workflow
+# template' task in awx-create-workflow.yml — this file cannot know them.
+- name: Delete TEST consolidated workflow before rebuild
+  tower_workflow_template:            # ← align with awx-create-workflow.yml
+    name: "TEST renew certs - aws - all clients"
+    organization: "{{ default_support_org }}"
+    state: absent
+    # tower_host: "{{ ... }}"         # ← copy from awx-create-workflow.yml
+    # tower_username: "{{ ... }}"     # ← copy from awx-create-workflow.yml
+    # tower_password: "{{ ... }}"     # ← copy from awx-create-workflow.yml
+    # validate_certs: false           # ← copy if present there
+  when: acm_test_workflow_delete | default(false) | bool
+
 # Step 5 — Create the workflow in AWX
 - name: Create consolidated AWS certs workflow
   include_tasks:
