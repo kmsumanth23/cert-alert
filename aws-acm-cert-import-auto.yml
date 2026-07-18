@@ -1,0 +1,107 @@
+---
+# Basic OS setup commands that should be run on every server
+- name: AWS Client VSI Bastian Setup
+  hosts: all
+  become: yes
+  gather_facts: yes
+  vars:
+    force_reboot: false
+    idx_obj: []
+  vars_files:
+    - aws-client-vars-base.yml
+
+  pre_tasks:
+    - name: Include the default and override variables
+      include_tasks: tasks/client-vars-include.yml
+      tags: common
+  tasks:
+    - name: Check if aws is installed
+      shell:
+        "which aws | cat"
+      args:
+        executable: /bin/bash
+      become: yes
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      register: awscmd
+      tags: certs
+
+    - name: DEBUG awscmd
+      debug:
+        msg: "{{ awscmd }}"
+      tags:
+        - debug
+        - never
+
+    - name: Install AWSCLI
+      shell: curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip";unzip -o awscliv2.zip;sudo ./aws/install;mkdir -p /root/.aws
+      become: yes
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      when: not awscmd.stdout
+      tags: certs
+
+    - name: Configure aws for client env
+      file:
+        path: /home/{{ client_code }}/.aws
+        state: directory
+        mode: "0755"
+#      shell: mkdir -p /home/{{ client_code }}/.aws
+#      become: yes
+        owner: "{{ client_code }}"
+#      mode: "0755"
+#      become_method: su
+#      become_exe: sudo su -
+#      when: not awscmd.stdout
+      tags: certs
+
+    - name: Change ownership
+      file:
+        path: /home/{{ client_code }}
+        owner: "{{ client_code }}"
+        group: "{{ client_code }}"
+        recurse: yes
+      tags: certs
+
+    - name: Creating a file with content for aws profile
+      copy:
+        dest: "/root/.aws/credentials"
+        content: |
+          [{{ profile }}]
+          aws_access_key_id = {{ access_val }}
+          aws_secret_access_key = {{ sec_val }}
+          role_arn = {{ arn_auto_admin_val }}
+          source_profile = {{ profile }}
+        mode: '0600'
+      register: value
+      tags: certs
+#      when: not awscmd.stdout
+
+    - name: Set profile env var 
+      set_fact:
+        "profile_{{ client_env_base }}": "srvc{{ client_env_base }}{{ client_code }}"
+      tags: certs
+
+    - name: Creating a file with content for aws profile respectively
+      copy:
+        dest: "/home/{{ client_code }}/.aws/credentials"
+        content: |
+          [{{ lookup( 'vars', 'profile_' + client_env_base ) }}]
+          aws_access_key_id = {{ lookup( 'vars', client_env_base +  '_access_val' ) }}
+          aws_secret_access_key = {{ lookup( 'vars', client_env_base +  '_sec_val' ) }}
+          role_arn = {{ lookup( 'vars', client_env_base +  '_role_arn' ) }}
+          source_profile = {{ lookup( 'vars', 'profile_' + client_env_base ) }}
+        mode: '0600'
+        owner: "{{ client_code }}"
+        tags: certs
+#      when: not awscmd.stdout
+
+    - name: include tasks to import cert to acm
+      include_tasks: tasks/aws-cert-import.yml
+      when: certificates | length > 0
+      tags: certs
+
+#      when: not kubectlcmd.stdout
+
