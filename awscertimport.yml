@@ -489,16 +489,24 @@
       error: 'No certificate matched this domain in ACM'
   tags: certs
 
+# The artifact key MUST match the digest's expected_reports manifest, which
+# is built from config-repo directory names. Inventory vars (client_code /
+# client_env) can diverge from directory names, so the workflow generator
+# passes the discovery identity in as acm_report_client / acm_report_env via
+# node extra_data — those win. Inventory vars remain the fallback so ad-hoc
+# (non-workflow) runs still publish a sensible key.
 - name: Publish consolidated digest artifact
   set_stats:
     data: "{{ { acm_report_key: acm_report_payload } }}"
     per_host: false
     aggregate: true
   vars:
-    acm_report_key: "acm_report_{{ client_code | regex_replace('[^A-Za-z0-9]', '_') }}_{{ client_env | regex_replace('[^A-Za-z0-9]', '_') }}"
+    acm_key_client: "{{ acm_report_client | default(client_code) }}"
+    acm_key_env: "{{ acm_report_env | default(client_env) }}"
+    acm_report_key: "acm_report_{{ acm_key_client | regex_replace('[^A-Za-z0-9]', '_') }}_{{ acm_key_env | regex_replace('[^A-Za-z0-9]', '_') }}"
     acm_report_payload:
-      client: "{{ client_code }}"
-      env: "{{ client_env }}"
+      client: "{{ acm_key_client }}"
+      env: "{{ acm_key_env }}"
       collected_at: "{{ ansible_date_time.iso8601 }}"
       renewal_threshold_days: "{{ client_cert_expiry_notice }}"
       certs: "{{ acm_report_rows | default([]) }}"
