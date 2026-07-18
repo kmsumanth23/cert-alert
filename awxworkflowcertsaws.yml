@@ -46,7 +46,21 @@
     - env.state == "directory"
     - env.path.split('/') | length == 2
     - aws_env_file is exists
-    - refresh_cert
+    # CREATION-ONLY TEST: acm_test_ignore_refresh_flag=true lets WHITELISTED
+    # envs in even when their refresh_certs flag is false/absent — so client
+    # grouping can be tested without editing config-repo files. Deliberately
+    # inert unless acm_cert_env_whitelist is also defined: without a whitelist
+    # the flag does nothing, so it can never widen production scope.
+    # NOTE: refresh_certs is a GENERATOR-side flag only. Inside the job, the
+    # cert-import include is gated on `certificates | length > 0` — an env
+    # with no certificates configured runs as a no-op and publishes an EMPTY
+    # report (fallback task in awsacmcertimportauto.yml), which is correct.
+    # CAUTION: whitelisted envs that DO have certificates run the REAL cert
+    # logic — a cert within its renewal threshold gets re-imported to ACM.
+    - >-
+      (refresh_cert | bool)
+      or ((acm_test_ignore_refresh_flag | default(false) | bool)
+          and (acm_cert_env_whitelist is defined))
     # CREATION-ONLY TEST: optional whitelist of 'client/env' strings, passed
     # as an extra var. On a test tower where most client inventories don't
     # exist, node creation fails for every missing inventory, the play aborts
@@ -103,7 +117,9 @@
                 'extra_data': {
                   'prod_ticket': tickets.get(e.client, {}).get(e.infra_code, ''),
                   'infra_code': e.infra_code,
-                  'now_cloud': 'aws'
+                  'now_cloud': 'aws',
+                  'acm_report_client': e.client,
+                  'acm_report_env': e.env
                 },
                 'related': {'always_nodes': [next_ident]}
               }) -%}
