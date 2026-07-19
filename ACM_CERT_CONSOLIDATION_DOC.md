@@ -131,14 +131,61 @@ Files in this repo are already in production form (TEST name removed, schedule r
 
 ### Maintenance extra-vars reference (all inert unless passed)
 
-| Var | Effect |
-|---|---|
-| `acm_cert_env_whitelist: ["client/env", ...]` | Restrict discovery to listed envs (test towers, emergency scope-cut, team-scoped builds) |
-| `acm_test_ignore_refresh_flag: true` | Whitelisted envs bypass `refresh_certs` (only works WITH a whitelist) |
-| `acm_test_workflow_delete: true` | Delete the leftover PoC TEST workflow before building |
-| `acm_scm_branch_override: <branch>` | Pin cert-JT nodes to a test SCM branch (PoC used `sum-cert-alert-aws`) |
-| `acm_digest_inventory: <name>` | Digest node inventory (default `Localhost-HCLNOW-DevOps`) |
-| `digest_expiry_days: <n>` (digest JT) | Override the 15-day window for a run (PoC used 45 to force an email) |
+| Var | Consumed by | Effect |
+|---|---|---|
+| `acm_cert_env_whitelist: ["client/env", ...]` | Generator | Restrict discovery to listed envs (test towers, emergency scope-cut, team-scoped builds) |
+| `acm_test_ignore_refresh_flag: true` | Generator | Whitelisted envs bypass `refresh_certs` (only works WITH a whitelist) |
+| `acm_test_workflow_delete: true` | Generator | Delete the leftover PoC TEST workflow before building |
+| `acm_scm_branch_override: <branch>` | Generator | Pin cert-JT nodes to a test SCM branch (PoC used `sum-cert-alert-aws`) |
+| `acm_digest_inventory: <name>` | Generator | Digest node inventory (default `Localhost-HCLNOW-DevOps`) |
+| `digest_expiry_days: <n>` | Digest JT | Override the 15-day window for a run (PoC used 45 to force an email) |
+
+### How to pass extra vars in the AWX tower
+
+There are two places to put them, and the difference matters:
+
+- **Launch prompt (preferred for all test/maintenance vars):** the generator's job template (`Initialize resources in awx`) already prompts for variables — it requires `awx_type` at launch — so paste the ACM vars into the **Extra Variables** box on the launch screen, alongside `awx_type`, in YAML. They apply to that one run only and leave nothing behind.
+- **Job template → Extra Variables field:** persists for **every** launch, including scheduled ones, until someone removes it. Use only for a deliberate standing override (e.g. keeping `digest_expiry_days` widened during a bake-in period). A test var left here is the moral equivalent of the hardcoded `set_fact` block we stripped at cutover — just relocated. Always clean it up.
+
+Why this works with zero code changes: **extra vars have the highest precedence in Ansible** — they beat the playbook's `vars:`, every `vars_files`, and all inventory/group vars. Every override in the table exists as a `default(...)`-guarded reference in the code, so an unset var means stock behavior.
+
+**Example 1 — test-tower generator run** (exactly what the PoC did, previously hardcoded in the reset `set_fact`):
+```yaml
+awx_type: <your usual value>
+acm_cert_env_whitelist:
+  - "hxtx/np"
+  - "hxsa/awsv9m"
+  - "hxsa/awsdevv9"
+  - "hxsa/awsfred"
+acm_test_ignore_refresh_flag: true
+acm_test_workflow_delete: true
+acm_scm_branch_override: "sum-cert-alert-aws"
+```
+
+**Example 2 — first production generator run** (one-time cleanup of the PoC TEST workflow):
+```yaml
+awx_type: <your usual value>
+acm_test_workflow_delete: true
+```
+
+**Example 3 — steady-state production run:** no ACM vars at all. Scope comes exclusively from `refresh_certs: true` in the config repo.
+
+**Example 4 — emergency scope-cut** (a client's account is broken and its branch fails daily; rebuild the workflow without it until fixed):
+```yaml
+awx_type: <your usual value>
+acm_cert_env_whitelist:
+  - "hxtx/np"
+  - "mosa/prd"
+  # ...every env EXCEPT the broken one
+```
+The whitelist shrinks the digest manifest too, so the excluded env raises no NO-report noise while out. Re-run the generator **without** the whitelist to restore full scope — don't forget, or the fleet silently stays shrunk.
+
+**Example 5 — digest window override** (digest JT → Extra Variables field, or via a temporary edit while testing):
+```yaml
+digest_expiry_days: 45
+```
+
+**Cert-import JT launched directly (ad-hoc / delegated runs):** the JT prompts for inventory; pass the established launch vars for this JT family — `infra_code`, `now_cloud`, and `prod_ticket` where applicable (the same three the workflow nodes inject). Do **not** pass `acm_report_client` / `acm_report_env` manually: they exist so the *generator* can pin artifact keys inside the workflow. An ad-hoc run correctly falls back to the inventory's `client_code`/`client_env`, and its artifact is consumed by nobody — harmless.
 
 ---
 
@@ -188,3 +235,24 @@ The generator's discovery + whitelist filter is already a bulk-selection mechani
 | False NO-report despite artifact published | Artifact key mismatch (inventory vars ≠ directory names) | Fixed by design: generator passes `acm_report_client/env`; verify the node's extra_data carries them |
 | "Username and Password sent without encryption" warning on mail | SMTP relay session without STARTTLS — same as the legacy per-cert mails | Accepted (internal relay); optionally add `secure: starttls` to mail tasks if the relay supports it |
 | No email on a day you expected one | All four buckets empty — healthy day | By design; check the digest job's "Digest summary" debug line |
+
+---
+
+## 10. Design note — why the generator uses `set_fact` instead of calling `awx.awx.workflow_job_template` / `workflow_job_template_node` directly
+
+The generator deliberately does **data assembly only** (build the list of node dicts via `set_fact` + Jinja) and then hands the finished structure to the repo's existing shared includes — `awx-create-workflow.yml`, `awx-create-workflow-nodes.yml`, `awx-create-schedule.yml` — which own the actual AWX module calls. Reasons:
+
+1. **Contract compatibility.** The per-client generator (`awx-workflow-certs.yml`) feeds those same includes with the same node-dict schema. The consolidated generator plugs into identical machinery, so both paths create workflows the same way, with the same module versions, same controller auth, same relation handling. One creation pipeline, two data sources.
+2. **Single change point for tower plumbing.** Controller hostname, credentials, module choice (`awx.awx.*` vs legacy `tower_*`), TLS options — all live once in the shared includes. If the generator called modules directly it would duplicate all of that (the PoC's Step 4b delete task is a small taste: it had to carry its own `controller_host/username/password`).
+3. **Separation of concerns = testability.** The hard part of this design is the *data*: chains, identifiers, extra_data, the manifest. As pure `set_fact` output it's printable (`Print consolidated workflow nodes`) and verifiable before anything touches AWX — which is exactly how the PoC debugged topology issues.
+
+### The optimization worth considering (later, not at cutover)
+
+The existing shared pipeline creates workflows in **two passes** — nodes first, then relations — and the PoC exposed its weakness twice: a node-creation failure aborts the play **before** the relation pass (leaving a linkless workflow), and the relation pass may skip unchanged nodes on rebuilds. A single call to `awx.awx.workflow_job_template` with the full `workflow_nodes:` list (the schema our node dicts already follow, including `related.always_nodes` by identifier and `all_parents_must_converge`) replaces both passes atomically: the module diffs and applies nodes + links + convergence in one idempotent operation, eliminating the linkless-workflow failure mode and the rebuild-delete dance entirely.
+
+Trade-offs to weigh before adopting it:
+- It bypasses the shared includes, so the consolidated path would diverge from how every other workflow on the tower is created (point 1 above) — or you migrate the shared includes themselves, which touches the GCP path too.
+- Per-node error behavior changes: today a missing inventory fails that one loop item and the log names it precisely; the single-call module fails the whole operation with one (less pinpointed) error.
+- Requires a recent `awx.awx` collection in the EE and its schema quirks validated against your AWX version.
+
+Verdict: correct future optimization, wrong cutover-day change. Ship production on the proven two-pass pipeline; revisit as a hygiene item once stable, ideally as a migration of the shared includes so *all* workflows benefit.
