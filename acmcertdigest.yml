@@ -30,10 +30,10 @@
     # ADJUST PATH if needed: same vars file the cert playbook loads for
     # smtp_server / smtp_port / smtp_auth_* / smtp_default_sender /
     # smtp_emails_certs / cloudops_group_emails.
-    - "{{ playbook_dir }}/aws-client-vars-base.yml"
+    - "aws-client-vars-base.yml"
   vars:
-    # Requirement 1: report every cert expiring within the next 15 days.
-    digest_expiry_days: 15
+    # Requirement 1: report every cert expiring within the next 45 days.
+    digest_expiry_days: 45
   tasks:
 
     - name: Assert expected_reports manifest was provided
@@ -111,7 +111,7 @@
         password: "{{ smtp_auth_pswd }}"
         sender: "{{ smtp_default_sender }}"
         to: "{{ smtp_emails_certs }}"
-        cc: "{{ cloudops_group_emails }}"
+        # cc: "{{ cloudops_group_emails }}"
         subtype: html
         subject: >-
           ACM Cert Digest | {{ '%Y-%m-%d' | strftime }} |
