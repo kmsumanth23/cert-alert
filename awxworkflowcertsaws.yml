@@ -33,6 +33,13 @@
     aws_cert_envs: []
     aws_cert_workflow_nodes: []
     awx_workflow_certs_aws: []
+    acm_cert_env_whitelist:
+      - "hxtx/np"
+      - "hxsa/awsv9m"
+      - "hxsa/awsdevv9"
+      - "hxsa/awsfred"
+    acm_test_workflow_delete: true
+    acm_test_ignore_refresh_flag: true
 
 # Step 1 — Discover every AWS client-env opted into cert renewal
 - name: Discover AWS client environments with refresh_certs enabled
@@ -51,6 +58,7 @@
     # grouping can be tested without editing config-repo files. Deliberately
     # inert unless acm_cert_env_whitelist is also defined: without a whitelist
     # the flag does nothing, so it can never widen production scope.
+
     # NOTE: refresh_certs is a GENERATOR-side flag only. Inside the job, the
     # cert-import include is gated on `certificates | length > 0` — an env
     # with no certificates configured runs as a no-op and publishes an EMPTY
@@ -61,6 +69,7 @@
       (refresh_cert | bool)
       or ((acm_test_ignore_refresh_flag | default(false) | bool)
           and (acm_cert_env_whitelist is defined))
+
     # CREATION-ONLY TEST: optional whitelist of 'client/env' strings, passed
     # as an extra var. On a test tower where most client inventories don't
     # exist, node creation fails for every missing inventory, the play aborts
@@ -114,6 +123,7 @@
                 'identifier': 'node-' ~ e.client ~ '-' ~ e.env,
                 'inventory': 'inventory_client_' ~ e.client ~ '_' ~ e.env,
                 'unified_job_template': {'name': 'Import Certificate to ACM in AWS', 'type': 'job_template'},
+                'scm_branch': 'sum-cert-alert-aws',
                 'extra_data': {
                   'prod_ticket': tickets.get(e.client, {}).get(e.infra_code, ''),
                   'infra_code': e.infra_code,
@@ -143,7 +153,7 @@
       # localhost on the EE, so no client hosts are touched. Any existing
       # inventory works; override via acm_digest_inventory if the default
       # name is absent on your tower. Keep the digest JT's Limit field EMPTY.
-      inventory: "{{ acm_digest_inventory | default('inventory_client_hxss_awsgss') }}"
+      inventory: "{{ acm_digest_inventory | default('Localhost-HCLNOW-DevOps') }}"
       # CREATION-ONLY TEST PREREQ #1: AWX resolves this job template BY NAME
       # at workflow-creation time — create the 'ACM Certs Digest Report' JT
       # first (a stub pointing at any playbook is enough for the creation
@@ -198,14 +208,13 @@
 # tower_password or equivalent) EXACTLY from the 'create the workflow
 # template' task in awx-create-workflow.yml — this file cannot know them.
 - name: Delete TEST consolidated workflow before rebuild
-  tower_workflow_template:            # ← align with awx-create-workflow.yml
+  awx.awx.workflow_job_template:
     name: "TEST renew certs - aws - all clients"
     organization: "{{ default_support_org }}"
     state: absent
-    # tower_host: "{{ ... }}"         # ← copy from awx-create-workflow.yml
-    # tower_username: "{{ ... }}"     # ← copy from awx-create-workflow.yml
-    # tower_password: "{{ ... }}"     # ← copy from awx-create-workflow.yml
-    # validate_certs: false           # ← copy if present there
+    controller_host: "{{ awx_uri }}"
+    controller_username: "{{ awx_username }}"
+    controller_password: "{{ awx_password }}"
   when: acm_test_workflow_delete | default(false) | bool
 
 # Step 5 — Create the workflow in AWX
