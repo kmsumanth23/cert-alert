@@ -102,7 +102,7 @@
   shell: kubectl get secret {{ certs_info[item].secret_name }} -n {{ certs_info[item].secret_namespace }} -o jsonpath='{.data.tls\.key} {.data.tls\.crt}'
   register: secret_raw
   no_log: true
-  become: yes
+  become: true
   become_user: root
   become_method: su
   become_exe: sudo su -
@@ -301,7 +301,7 @@
     --certificate-chain fileb:///data/private/{{ item }}-intermediate_cert.crt
     {% endif %}
   register: import_result
-  become: yes
+  become: true
   become_user: root
   become_method: su
   become_exe: sudo su -
