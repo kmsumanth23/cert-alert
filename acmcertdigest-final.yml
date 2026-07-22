@@ -1,0 +1,126 @@
+---
+# aws-v9-automation/acm-cert-digest.yml
+#
+# "ACM Certs Digest Report" — the convergence node of the consolidated
+# AWS cert-renewal workflow.
+#
+# Inputs (arrive automatically as extra_vars):
+#   - acm_report_<client>_<env> ... one artifact per client-env branch,
+#     published via set_stats by aws-cert-import.yml and propagated by
+#     AWX workflow artifact inheritance.
+#   - expected_reports ............ list of {client, env, infra_code},
+#     injected as extra_data on this workflow node by the generator
+#     (awx-workflow-certs-aws.yml). Lets us detect branches that died
+#     before publishing a report — silence is never treated as healthy.
+#
+# Sends ONE HTML email, and only when there is something to say:
+# certs expiring within digest_expiry_days, renewed today, failed,
+# or client-envs that produced no report. All-healthy days send nothing.
+
+# EXECUTION MODEL: runs on the implicit localhost of the execution
+# environment — the same place the cert jobs' mail tasks already run
+# (delegate_to: localhost), so SMTP reachability is proven. The job
+# template's inventory contents are irrelevant; it just has to exist.
+# IMPORTANT: the job template's Limit field MUST be empty — a limit like
+# 'bastion*' filters out localhost and fails with "does not match any hosts".
+- name: ACM certificate consolidated digest
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    # ADJUST PATH if needed: same vars file the cert playbook loads for
+    # smtp_server / smtp_port / smtp_auth_* / smtp_default_sender /
+    # smtp_emails_certs / cloudops_group_emails.
+    - "aws-client-vars-base.yml"
+  vars:
+    # Requirement 1: report every cert expiring within the next 15 days.
+    # (Play var — an extra var of the same name on the JT overrides it,
+    # which is how the PoC forced emails with a 45-day window.)
+    digest_expiry_days: 15
+  tasks:
+
+    - name: Assert expected_reports manifest was provided
+      assert:
+        that:
+          - expected_reports is defined
+          - expected_reports | length > 0
+        fail_msg: >-
+          expected_reports was not passed via the workflow node's extra_data.
+          The digest cannot distinguish 'healthy' from 'never reported'
+          without it — check the generated workflow node configuration.
+
+    - name: Initialise digest buckets
+      set_fact:
+        digest_certs: []
+        missing_reports: []
+
+    - name: Collect artifact from each expected client-env
+      set_fact:
+        digest_certs: "{{ digest_certs + (branch_rows if branch_report else []) }}"
+        missing_reports: "{{ missing_reports + ([] if branch_report else [expected]) }}"
+      loop: "{{ expected_reports }}"
+      loop_control:
+        loop_var: expected
+        label: "{{ expected.client }}/{{ expected.env }}"
+      vars:
+        report_key: "acm_report_{{ expected.client | regex_replace('[^A-Za-z0-9]', '_') }}_{{ expected.env | regex_replace('[^A-Za-z0-9]', '_') }}"
+        branch_report: "{{ lookup('vars', report_key, default={}) }}"
+        branch_rows: "{{ branch_report.certs | default([]) | map('combine', {'client': expected.client, 'env': expected.env}) | list }}"
+
+    - name: Classify failed and renewed certificates
+      set_fact:
+        failed_rows: "{{ digest_certs | selectattr('status', 'in', ['import_failed', 'chain_verify_failed', 'not_found_in_acm']) | list }}"
+        renewed_rows: "{{ digest_certs | selectattr('status', 'equalto', 'renewed') | list }}"
+        expiring_rows: []
+
+    # Loop + when instead of selectattr('le', ...) because set_fact values
+    # can be strings — lexicographic comparison on days_left would be wrong.
+    # days_left is normalized to int here so the template can sort on it.
+    - name: Identify certificates expiring within {{ digest_expiry_days }} days
+      set_fact:
+        expiring_rows: "{{ expiring_rows + [row | combine({'days_left': row.days_left | int})] }}"
+      loop: "{{ digest_certs }}"
+      loop_control:
+        loop_var: row
+        label: "{{ row.client }}/{{ row.env }}/{{ row.domain }}"
+      when:
+        - row.status not in ['renewed', 'import_failed', 'chain_verify_failed', 'not_found_in_acm']
+        - (row.days_left | string | length) > 0
+        - (row.days_left | int) <= (digest_expiry_days | int)
+
+    - name: Show digest summary in job output
+      debug:
+        msg: >-
+          Digest summary: {{ expiring_rows | length }} expiring within
+          {{ digest_expiry_days }} days, {{ renewed_rows | length }} renewed,
+          {{ failed_rows | length }} failed,
+          {{ missing_reports | length }} client-env(s) with no report,
+          {{ digest_certs | length }} certs scanned across
+          {{ expected_reports | length }} client-env(s).
+
+    - name: Nothing to report — end without sending email
+      meta: end_play
+      when:
+        - failed_rows | length == 0
+        - renewed_rows | length == 0
+        - expiring_rows | length == 0
+        - missing_reports | length == 0
+
+    - name: Send consolidated digest email
+      mail:
+        host: "{{ smtp_server }}"
+        port: "{{ smtp_port }}"
+        username: "{{ smtp_auth_user }}"
+        password: "{{ smtp_auth_pswd }}"
+        sender: "{{ smtp_default_sender }}"
+        to: "{{ smtp_emails_certs }}"
+        # cc: "{{ cloudops_group_emails }}"
+        subtype: html
+        subject: >-
+          ACM Cert Digest | {{ '%Y-%m-%d' | strftime }} |
+          {{ expiring_rows | length }} expiring,
+          {{ renewed_rows | length }} renewed,
+          {{ failed_rows | length }} failed{{
+            (', ' ~ (missing_reports | length | string) ~ ' no-report')
+            if missing_reports | length > 0 else ''
+          }}
+        body: "{{ lookup('template', 'templates/acm_digest_mail.html.j2') }}"
