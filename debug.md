@@ -58,3 +58,22 @@ gcloud logging read \
 kubectl -n kohl-uni-np get deploy velero-fsb-test -o yaml | grep -A5 annotations
 kubectl -n velero get schedule kohl-np-velero-2-hours -o yaml | grep -iE "defaultVolumes|snapshotVolumes|labelSelector"
 
+# Was it one CR or all five?
+kubectl -n velero get backuprepository
+
+# Did the maintenance error spam stop?
+kubectl -n velero logs deployment/velero -c velero --since=1h | grep -i "maintenance\|prune"
+
+# Still nothing in the bucket? (expected at this point)
+gcloud storage ls gs://hclsw-hss-bkt-kohl-np-velero/
+
+kubectl create ns velero-fsb-validate
+
+velero backup create fsb-validate-$(date +%H%M) \
+  --include-namespaces velero-fsb-validate --wait
+
+kubectl -n velero logs -l name=node-agent --since=10m | grep -iE "initializ|connect|repo"
+gcloud storage ls -r gs://hclsw-hss-bkt-kohl-np-velero/kopia/
+
+kubectl -n velero get ds node-agent -o jsonpath='{.spec.template.spec.serviceAccountName}{"\n"}'
+kubectl -n velero get sa <sa-name> -o yaml | grep -i "iam.gke.io/gcp-service-account"
