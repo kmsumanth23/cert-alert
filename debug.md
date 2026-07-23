@@ -77,3 +77,60 @@ gcloud storage ls -r gs://hclsw-hss-bkt-kohl-np-velero/kopia/
 
 kubectl -n velero get ds node-agent -o jsonpath='{.spec.template.spec.serviceAccountName}{"\n"}'
 kubectl -n velero get sa <sa-name> -o yaml | grep -i "iam.gke.io/gcp-service-account"
+
+
+kubectl create ns velero-fsb-validate
+
+cat <<'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fsb-test-pvc
+  namespace: velero-fsb-validate
+spec:
+  storageClassName: standard-rwo
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fsb-test-pod
+  namespace: velero-fsb-validate
+  annotations:
+    backup.velero.io/backup-volumes: test-vol
+spec:
+  containers:
+  - name: app
+    image: busybox:1.36
+    command: ["sh", "-c", "sleep 3600"]
+    volumeMounts:
+    - name: test-vol
+      mountPath: /data
+  volumes:
+  - name: test-vol
+    persistentVolumeClaim:
+      claimName: fsb-test-pvc
+EOF
+
+kubectl -n velero-fsb-validate wait --for=condition=Ready pod/fsb-test-pod --timeout=120s
+kubectl -n velero-fsb-validate exec fsb-test-pod -- sh -c 'echo velero-fsb-check > /data/marker.txt'
+
+velero backup create fsb-validate-$(date +%H%M) \
+  --include-namespaces velero-fsb-validate \
+  --snapshot-volumes=false \
+  --ttl 24h --wait
+
+velero backup describe fsb-validate-XXXX --details
+kubectl -n velero get podvolumebackup -o wide | tail -5
+kubectl -n velero logs -l name=node-agent --since=15m | grep -iE "initializ|connect|repo"
+gcloud storage ls -r gs://hclsw-hss-bkt-kohl-np-velero/kopia/
+kubectl -n velero get backuprepository
+
+kubectl -n velero get ds node-agent -o jsonpath='{.spec.template.spec.serviceAccountName}{"\n"}'
+kubectl -n velero get sa <sa-name> -o yaml | grep -i "iam.gke.io/gcp-service-account"
+
+velero backup delete fsb-validate-XXXX --confirm
+kubectl delete ns velero-fsb-validate
