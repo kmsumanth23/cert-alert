@@ -134,3 +134,10 @@ kubectl -n velero get sa <sa-name> -o yaml | grep -i "iam.gke.io/gcp-service-acc
 
 velero backup delete fsb-validate-XXXX --confirm
 kubectl delete ns velero-fsb-validate
+
+kubectl get pv -o json | jq -r '
+  .items[] | select(.spec.csi.driver=="filestore.csi.storage.gke.io") |
+  [ (.spec.claimRef.namespace + "/" + .spec.claimRef.name),
+    .spec.storageClassName, .spec.capacity.storage,
+    (if (.spec.csi.volumeHandle|startswith("modeMultishare"))
+     then "MULTISHARE-NO-SNAPSHOT" else "single-share-ok" end) ] | @tsv' | column -t
