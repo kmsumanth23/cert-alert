@@ -35,3 +35,26 @@ kubectl -n kohl-uni-np get pods -o json | jq -r '
   .items[] | select(.metadata.annotations["backup.velero.io/backup-volumes"] != null or
                     .metadata.annotations["backup.velero.io/backup-volumes-excludes"] != null) |
   [.metadata.name, .metadata.annotations["backup.velero.io/backup-volumes"]] | @tsv'
+
+
+---
+
+gcloud storage buckets describe gs://hclsw-hss-bkt-kohl-np-velero \
+  --format="default(lifecycle,versioning,retentionPolicy,softDeletePolicy)"
+
+# What prefixes actually survive?
+gcloud storage ls gs://hclsw-hss-bkt-kohl-np-velero/
+
+# Soft-delete may still hold the objects — this is the fastest recovery path
+gcloud storage ls --soft-deleted gs://hclsw-hss-bkt-kohl-np-velero/kopia/ 2>/dev/null | head
+
+# Who deleted them? (needs Data Access audit logs enabled)
+gcloud logging read \
+  'resource.type="gcs_bucket" AND resource.labels.bucket_name="hclsw-hss-bkt-kohl-np-velero"
+   AND protoPayload.methodName=~"storage.objects.delete"' \
+  --freshness=90d --limit=20 \
+  --format="table(timestamp,protoPayload.authenticationInfo.principalEmail,protoPayload.resourceName)"
+
+kubectl -n kohl-uni-np get deploy velero-fsb-test -o yaml | grep -A5 annotations
+kubectl -n velero get schedule kohl-np-velero-2-hours -o yaml | grep -iE "defaultVolumes|snapshotVolumes|labelSelector"
+
