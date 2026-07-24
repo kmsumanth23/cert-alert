@@ -141,3 +141,12 @@ kubectl get pv -o json | jq -r '
     .spec.storageClassName, .spec.capacity.storage,
     (if (.spec.csi.volumeHandle|startswith("modeMultishare"))
      then "MULTISHARE-NO-SNAPSHOT" else "single-share-ok" end) ] | @tsv' | column -t
+
+
+kubectl -n kohl-uni-np get pod hcl-unica-campaign-5885d7ccc5-qhjns \
+  -o jsonpath='{range .spec.volumes[*]}{.name}{" -> "}{.persistentVolumeClaim.claimName}{"\n"}{end}'
+
+kubectl -n velero get podvolumebackup -l velero.io/backup-name=test-kopia-fix \
+  -o custom-columns='NAME:.metadata.name,VOL:.spec.volume,PHASE:.status.phase,DONE:.status.progress.bytesDone,TOTAL:.status.progress.totalBytes'
+
+gcloud storage du -s gs://hclsw-hss-bkt-kohl-np-velero/kopia/kohl-uni-np/
