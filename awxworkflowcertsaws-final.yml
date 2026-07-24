@@ -33,6 +33,15 @@
 # overrides (acm_cert_env_whitelist, acm_test_ignore_refresh_flag,
 # acm_test_workflow_delete, acm_scm_branch_override) remain available as
 # EXTRA VARS for maintenance/testing and are inert when not passed.
+#
+# SEPARATE / SCOPED WORKFLOW: to build a distinct workflow for a subset of
+# clients (e.g. a team-owned "renew certs - aws - hxtx mosa txle"), pass
+# BOTH extra vars together:
+#   acm_workflow_name_override: "renew certs - aws - <your name>"
+#   acm_cert_env_whitelist:     ["hxtx","mosa","txle"]   # whole clients or client/env
+# The name override gives it its own AWX object, so the main workflow is
+# left untouched. A whitelist WITHOUT the override rebuilds the MAIN workflow
+# with only the listed clients — i.e. it drops everyone else.
 - name: Reset AWS consolidated cert workflow facts
   set_fact:
     aws_cert_envs: []
@@ -68,14 +77,22 @@
       or ((acm_test_ignore_refresh_flag | default(false) | bool)
           and (acm_cert_env_whitelist is defined))
 
-    # TEST/MAINTENANCE OVERRIDE: optional whitelist of 'client/env' strings,
-    # passed as an extra var, to limit scope (test towers, emergency
-    # scope-reduction, or building team-scoped workflows). Filtering at
-    # discovery keeps nodes, chain links, and the digest's expected_reports
-    # manifest consistent with each other.
-    # Example: -e '{"acm_cert_env_whitelist": ["hxtx/np", "hxsa/awsv9m"]}'
+    # TEST/MAINTENANCE OVERRIDE: optional whitelist to limit scope (test
+    # towers, emergency scope-reduction, or building team-scoped workflows).
+    # Each entry may be EITHER a whole client ("hxtx" = all of hxtx's envs)
+    # OR a single env ("hxtx/np" = just that env). Filtering at discovery
+    # keeps nodes, chain links, and the digest's expected_reports manifest
+    # consistent with each other.
+    # Example (whole clients): -e '{"acm_cert_env_whitelist": ["hxtx","mosa","txle"]}'
+    # Example (specific envs):  -e '{"acm_cert_env_whitelist": ["hxtx/np","hxsa/awsv9m"]}'
     # Leave UNDEFINED in production to include everything.
-    - (acm_cert_env_whitelist is not defined) or (env.path in acm_cert_env_whitelist)
+    # IMPORTANT: a whitelist alone rebuilds the SAME workflow with fewer
+    # clients. To build a SEPARATE workflow, ALSO pass acm_workflow_name_override
+    # (Step 4) — otherwise you shrink the main production workflow.
+    - >-
+      (acm_cert_env_whitelist is not defined)
+      or (env.path in acm_cert_env_whitelist)
+      or (awx_client_code in acm_cert_env_whitelist)
   vars:
     awx_client_code: "{{ env.path.split('/')[0] }}"
     awx_client_env: "{{ env.path.split('/')[1] }}"
@@ -175,31 +192,46 @@
 
 # Step 4 — Build the single workflow object (same schema the per-client
 # generator feeds into awx-create-workflow.yml / awx-create-schedule.yml).
+#
+# SEPARATE / SCOPED WORKFLOW: pass acm_workflow_name_override (+ a whitelist,
+# Step 1) to build a distinct workflow for a subset of clients. The name
+# override makes it its own AWX object, so the main "renew certs - aws - all
+# clients" workflow is left untouched.
 - name: Prepare consolidated AWS certs workflow template
   set_fact:
     awx_workflow_certs_aws:
-      - name: "renew certs - aws - all clients"
+      - name: "{{ acm_workflow_name_override | default('renew certs - aws - all clients') }}"
         organization: "{{ default_support_org }}"
         ask_inventory_on_launch: false
         ask_scm_branch_on_launch: false
         state: present
         description: >-
-          Consolidated AWS cert renewal across all clients. One branch per
-          client (envs sequential), converging on a single digest email.
-          Driven by var refresh_certs in aws-client-vars-env.yml.
+          Consolidated AWS cert renewal{{
+            (' — ' ~ acm_workflow_name_override) if acm_workflow_name_override is defined
+            else ' across all clients'
+          }}. One branch per client (envs sequential), converging on a single
+          digest email. Driven by var refresh_certs in aws-client-vars-env.yml.
           Scheduled daily.
         workflow_nodes: "{{ aws_cert_workflow_nodes }}"
-        schedule: ["Runs daily certs"]
+        # Schedule name is per-workflow; a scoped workflow gets its own
+        # schedule object of the same name. Override with acm_schedule_override
+        # if your tower requires globally-unique schedule names.
+        schedule: ["{{ acm_schedule_override | default('Runs daily certs') }}"]
         allow_simultaneous: false
   when: aws_cert_workflow_nodes | length > 1
 
-# Step 4b — one-time cleanup: remove the leftover TEST workflow from the
-# PoC. Pass extra var acm_test_workflow_delete: true on the FIRST production
-# generator run to delete it; inert (skipped) on every run without the var.
-# Safe to remove this whole task once the TEST workflow is gone.
-- name: Delete leftover TEST consolidated workflow from PoC
+# Step 4b — opt-in clean rebuild: delete the workflow being built BEFORE
+# rebuilding it, so nodes+links are recreated from scratch (recovers from a
+# half-built/linkless workflow left by an aborted earlier run). Targets the
+# SAME name Step 4 builds, so with acm_workflow_name_override it deletes the
+# scoped workflow, and without it the main one.
+#   - clean-rebuild a scoped workflow: acm_workflow_name_override + whitelist + acm_test_workflow_delete: true
+#   - (the leftover PoC "TEST renew certs - aws - all clients" workflow, if any,
+#     is deleted in the AWX UI — it is no longer this task's default target)
+# Inert (skipped) on any run without acm_test_workflow_delete.
+- name: Delete target consolidated workflow before rebuild (opt-in)
   awx.awx.workflow_job_template:
-    name: "TEST renew certs - aws - all clients"
+    name: "{{ acm_workflow_name_override | default('renew certs - aws - all clients') }}"
     organization: "{{ default_support_org }}"
     state: absent
     controller_host: "{{ awx_uri }}"
