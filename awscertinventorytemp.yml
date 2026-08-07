@@ -1,0 +1,81 @@
+---
+# TEMPORARY — full IMPORTED-certificate inventory report
+#
+# Drop-in replacement for TWO tasks in your read-mode copy of
+# tasks/aws-cert-import.yml:
+#
+#   1. "Get ACM Certificate Details"              <- replace
+#   2. "Build certificate information dictionary" <- replace
+#
+# Everything downstream (Mark certificates expiring soon, Build sanitized
+# report rows, Publish consolidated digest artifact, the digest email) is
+# UNCHANGED and keeps the exact same report format. The only difference is
+# where certs_info comes from: every IMPORTED cert in the account/region,
+# instead of only the domains listed in tools.yml.
+#
+# Safety: renewal_due is hardcoded false, so even if the renewal tasks are
+# un-commented they will all skip. This block is read-only by construction
+# (ACM ListCertificates + DescribeCertificate).
+#
+# DELETE THIS FILE when the temporary reporting exercise is done.
+
+- name: Get ALL ACM certificates in the region
+  community.aws.acm_certificate_info:
+    region: "{{ aws_region }}"
+  register: all_acm_certs
+  delegate_to: localhost
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+    AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+    AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+  tags:
+    - certs
+
+- name: Show how many certificates were returned
+  debug:
+    msg: >-
+      ACM returned {{ all_acm_certs.certificates | default([]) | length }} cert(s)
+      in {{ aws_region }};
+      {{ all_acm_certs.certificates | default([]) | selectattr('type', 'defined')
+         | selectattr('type', 'equalto', 'IMPORTED') | list | length }} are IMPORTED.
+  tags:
+    - certs
+
+# Keyed by domain, same as the original task, so every downstream task works
+# unchanged. Sorted by expiry DESCENDING so that if two imported certs share a
+# domain, the last write wins = the one expiring SOONEST (the urgent one).
+- name: Build certificate information dictionary (all IMPORTED certs)
+  set_fact:
+    certs_info: "{{ certs_info | default({}) | combine({ c.domain_name: cert_details }) }}"
+  loop: >-
+    {{ all_acm_certs.certificates | default([])
+       | selectattr('type', 'defined') | selectattr('type', 'equalto', 'IMPORTED')
+       | selectattr('not_after', 'defined')
+       | sort(attribute='not_after', reverse=true) }}
+  loop_control:
+    loop_var: c
+    label: "{{ c.domain_name | default('?') }}"
+  vars:
+    cert_details:
+      cert_arn: "{{ c.certificate_arn }}"
+      not_after: "{{ c.not_after }}"
+      expire_ts: "{{ (c.not_after | to_datetime('%Y-%m-%dT%H:%M:%S%z')).timestamp() | int }}"
+      current_ts: "{{ ansible_date_time.epoch | int }}"
+      # Report-only: never trigger the k8s-secret / import path. These certs
+      # have no tools.yml entry, so there is no secret to pull.
+      renewal_due: false
+      secret_name: ''
+      secret_namespace: ''
+  tags:
+    - certs
+
+# The original "Note configured domains with no matching certificate in ACM"
+# task compares tools.yml domains against certs_info. In inventory mode that
+# would wrongly flag tracked domains whose cert is AMAZON_ISSUED (they are in
+# ACM, just not imported). Neutralise it by REPLACING that task's body with
+# this, or simply comment that task out:
+#
+#   - name: Note configured domains with no matching certificate in ACM
+#     set_fact:
+#       acm_missing_domains: []
+#     tags: certs
