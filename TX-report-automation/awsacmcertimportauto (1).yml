@@ -1,0 +1,223 @@
+---
+# Basic OS setup commands that should be run on every server
+#
+# CHANGE (consolidated-digest redesign): added a fallback publish task after
+# the cert-import include. An env with no certificates configured now
+# publishes an EMPTY digest artifact instead of nothing, so the digest can
+# distinguish "no certs configured here" (healthy, empty report) from
+# "job died before reporting" (NO-report alarm row).
+- name: AWS Client VSI Bastian Setup
+  hosts: all
+  become: yes
+  gather_facts: yes
+  vars:
+    force_reboot: false
+    idx_obj: []
+  vars_files:
+    - aws-client-vars-base.yml
+
+  pre_tasks:
+    - name: Include the default and override variables
+      include_tasks: tasks/client-vars-include.yml
+      tags: common
+  tasks:
+    - name: Check if aws is installed
+      shell:
+        "which aws | cat"
+      args:
+        executable: /bin/bash
+      become: yes
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      register: awscmd
+      tags: certs
+
+    - name: DEBUG awscmd
+      debug:
+        msg: "{{ awscmd }}"
+      tags:
+        - debug
+        - never
+
+    - name: Install AWSCLI
+      shell: curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip";unzip -o awscliv2.zip;sudo ./aws/install;mkdir -p /root/.aws
+      become: yes
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      when: not awscmd.stdout
+      tags: certs
+
+    - name: Configure aws for client env
+      file:
+        path: /home/{{ client_code }}/.aws
+        state: directory
+        mode: "0755"
+#      shell: mkdir -p /home/{{ client_code }}/.aws
+#      become: yes
+        owner: "{{ client_code }}"
+#      mode: "0755"
+#      become_method: su
+#      become_exe: sudo su -
+#      when: not awscmd.stdout
+      tags: certs
+
+    - name: Change ownership
+      file:
+        path: /home/{{ client_code }}
+        owner: "{{ client_code }}"
+        group: "{{ client_code }}"
+        recurse: yes
+      tags: certs
+
+    - name: Creating a file with content for aws profile
+      copy:
+        dest: "/root/.aws/credentials"
+        content: |
+          [{{ profile }}]
+          aws_access_key_id = {{ access_val }}
+          aws_secret_access_key = {{ sec_val }}
+          role_arn = {{ arn_auto_admin_val }}
+          source_profile = {{ profile }}
+        mode: '0600'
+      register: value
+      tags: certs
+#      when: not awscmd.stdout
+
+    - name: Set profile env var
+      set_fact:
+        "profile_{{ client_env_base }}": "srvc{{ client_env_base }}{{ client_code }}"
+      tags: certs
+
+    - name: Creating a file with content for aws profile respectively
+      copy:
+        dest: "/home/{{ client_code }}/.aws/credentials"
+        content: |
+          [{{ lookup( 'vars', 'profile_' + client_env_base ) }}]
+          aws_access_key_id = {{ lookup( 'vars', client_env_base +  '_access_val' ) }}
+          aws_secret_access_key = {{ lookup( 'vars', client_env_base +  '_sec_val' ) }}
+          role_arn = {{ lookup( 'vars', client_env_base +  '_role_arn' ) }}
+          source_profile = {{ lookup( 'vars', 'profile_' + client_env_base ) }}
+        mode: '0600'
+        owner: "{{ client_code }}"
+        tags: certs
+#      when: not awscmd.stdout
+
+    # ------------------------------------------------------------------
+    # TX CLIENTS — source `certificates` from the TX repo instead of
+    # tools.yml. Entirely gated on acm_certs_source == 'tx', which the TX
+    # workflow's nodes inject via extra_data. For every other client this
+    # block is skipped and behaviour is exactly as before.
+    #
+    # Inputs (from the TX workflow node's extra_data, with defaults):
+    #   acm_certs_source : 'tx' switches this on
+    #   acm_tx_vars_file : gcp-shared-services/playbooks/dns/tx-cloud-cert-vars.yml
+    #                      -> namespace (secret_namespace), valid_suffix
+    #   acm_tx_dns_file  : hclnow-client-hxtx/hclsoftware-cloud-dns-<env>.yml
+    #                      -> dns: [] records, combined across TX clients
+    #
+    # Derivation per DNS record (validated against the test + prod files):
+    #   dns_full_name "qa-custa.hxtx.now.hclsoftware.cloud."
+    #     -> strip trailing dot        "qa-custa.hxtx.now.hclsoftware.cloud"
+    #     -> strip .valid_suffix       "qa-custa.hxtx"
+    #     -> drop last label (client)  "qa-custa"
+    #     -> dots to hyphens + '-tls'  "qa-custa-tls"
+    #   domain_name      = FQDN without the trailing dot
+    #   secret_namespace = tx-cloud-cert-vars.yml -> namespace
+    # ------------------------------------------------------------------
+    - name: Load TX shared cert vars
+      set_fact:
+        tx_cert_vars: "{{ lookup('file', acm_tx_vars_file) | from_yaml }}"
+      vars:
+        acm_tx_vars_file: >-
+          {{ acm_tx_vars_file
+             | default(base_src ~ '/gcp-shared-services/playbooks/dns/tx-cloud-cert-vars.yml', true) }}
+      when: (acm_certs_source | default('')) == 'tx'
+      tags: certs
+
+    - name: Load TX DNS records
+      set_fact:
+        tx_dns_records: "{{ (lookup('file', acm_tx_dns_file) | from_yaml).dns | default([]) }}"
+      vars:
+        acm_tx_dns_file: >-
+          {{ acm_tx_dns_file
+             | default(base_src ~ '/hclnow-client-hxtx/hclsoftware-cloud-dns-prod.yml', true) }}
+      when: (acm_certs_source | default('')) == 'tx'
+      tags: certs
+
+    - name: Reset certificates list for TX sourcing
+      set_fact:
+        certificates: []
+      when: (acm_certs_source | default('')) == 'tx'
+      tags: certs
+
+    # Wildcard records ('*.client...') would derive an invalid k8s secret
+    # name, so they are skipped here and reported by the next task.
+    - name: Build TX certificates list from DNS records
+      set_fact:
+        certificates: "{{ certificates + [cert_entry] }}"
+      loop: "{{ tx_dns_records | default([]) }}"
+      loop_control:
+        loop_var: rec
+        label: "{{ rec.dns_full_name | default('?') }}"
+      when:
+        - (acm_certs_source | default('')) == 'tx'
+        - rec.dns_full_name is defined
+        - (rec.dns_type | default('A') | upper) in ['A', 'CNAME']
+        - not tx_fqdn.startswith('_acme-challenge.')
+        - not tx_host.startswith('*')
+        - tx_host_labels | length > 1
+        - tx_client_label == (acm_report_client | default(client_code))
+      vars:
+        tx_fqdn: "{{ rec.dns_full_name | regex_replace('\\.$', '') }}"
+        tx_suffix: "{{ tx_cert_vars.valid_suffix | default('now.hclsoftware.cloud') }}"
+        tx_host: "{{ tx_fqdn | regex_replace('\\.' ~ (tx_suffix | regex_escape) ~ '$', '') }}"
+        tx_host_labels: "{{ tx_host.split('.') }}"
+        tx_client_label: "{{ tx_host_labels[-1] }}"
+        cert_entry:
+          domain_name: "{{ tx_fqdn }}"
+          secret_name: "{{ (tx_host_labels[:-1] | join('-')) ~ '-tls' }}"
+          secret_namespace: "{{ tx_cert_vars.namespace | default('hclnow-certs') }}"
+      tags: certs
+
+    - name: Show TX certificates derived for this client env
+      debug:
+        msg: >-
+          TX source: {{ tx_dns_records | default([]) | length }} DNS record(s) read,
+          {{ certificates | length }} certificate(s) derived for
+          {{ acm_report_client | default(client_code) }}/{{ acm_report_env | default(client_env) }}
+          -> {{ certificates | map(attribute='secret_name') | list }}
+      when: (acm_certs_source | default('')) == 'tx'
+      tags: certs
+
+    - name: include tasks to import cert to acm
+      include_tasks: tasks/aws-cert-import.yml
+      when: certificates | length > 0
+      tags: certs
+
+#      when: not kubectlcmd.stdout
+
+    # No certificates configured for this client env: publish an EMPTY
+    # report so the consolidated digest counts this env as "reported,
+    # nothing to check" instead of raising a NO-report alarm row.
+    # Key construction mirrors the publish task in tasks/aws-cert-import.yml:
+    # acm_report_client/acm_report_env (workflow node extra_data) win,
+    # inventory vars are the fallback for ad-hoc runs.
+    - name: Publish empty digest artifact when no certificates configured
+      set_stats:
+        data: "{{ { acm_report_key: acm_report_payload } }}"
+        per_host: false
+        aggregate: true
+      vars:
+        acm_key_client: "{{ acm_report_client | default(client_code) }}"
+        acm_key_env: "{{ acm_report_env | default(client_env) }}"
+        acm_report_key: "acm_report_{{ acm_key_client | regex_replace('[^A-Za-z0-9]', '_') }}_{{ acm_key_env | regex_replace('[^A-Za-z0-9]', '_') }}"
+        acm_report_payload:
+          client: "{{ acm_key_client }}"
+          env: "{{ acm_key_env }}"
+          collected_at: "{{ ansible_date_time.iso8601 }}"
+          renewal_threshold_days: "{{ client_cert_expiry_notice | default(0) }}"
+          certs: []
+      when: certificates | default([]) | length == 0
+      tags: certs

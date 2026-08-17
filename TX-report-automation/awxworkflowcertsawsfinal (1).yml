@@ -1,0 +1,343 @@
+---
+# gcp-shared-services/playbooks/awx/kube/awx-workflow-certs-aws.yml
+#
+# Builds ONE consolidated AWS cert-renewal workflow (replaces the
+# per-client AWS workflows produced by awx-workflow-certs.yml; the GCP
+# path of that file is untouched and still runs per client).
+#
+# Topology (the "grouped by client" shape):
+#
+#   [hxsa-np] -> [hxsa-prd] ----------.
+#   [mosa-np] -> [mosa-prd] ----------+--> [ACM Certs Digest Report]
+#   [hxco-np] ------------------------'         (converge: ALL)
+#
+#   - one branch per client; a client's envs run SEQUENTIALLY,
+#     chained with always_nodes (preserves today's per-client
+#     serialization — no two envs hit the same client concurrently)
+#   - clients run in PARALLEL as independent branches
+#   - every client's LAST env node always-links to the digest node
+#   - digest node has all_parents_must_converge: true, so it waits
+#     for every branch and runs even when branches fail
+#
+# Discovery: every clients/<client>/<env>/aws-client-vars-env.yml in
+# the config repo with refresh_certs: true. The SAME discovery result
+# feeds both the workflow nodes and the digest node's expected_reports
+# manifest, so they can never drift apart.
+#
+# IMPORTANT: include this file ONCE per generator run (it discovers all
+# clients itself) — NOT inside the per-client loop that includes
+# awx-workflow-certs.yml.
+
+# PRODUCTION: no test vars are set here. Scope is governed purely by
+# refresh_certs: true in each env's aws-client-vars-env.yml. The test
+# overrides (acm_cert_env_whitelist, acm_test_ignore_refresh_flag,
+# acm_test_workflow_delete, acm_scm_branch_override) remain available as
+# EXTRA VARS for maintenance/testing and are inert when not passed.
+#
+# SEPARATE / SCOPED WORKFLOW: to build a distinct workflow for a subset of
+# clients (e.g. a team-owned "renew certs - aws - hxtx mosa txle"), pass
+# BOTH extra vars together:
+#   acm_workflow_name_override: "renew certs - aws - <your name>"
+#   acm_cert_env_whitelist:     ["hxtx","mosa","txle"]   # whole clients or client/env
+# The name override gives it its own AWX object, so the main workflow is
+# left untouched. A whitelist WITHOUT the override rebuilds the MAIN workflow
+# with only the listed clients — i.e. it drops everyone else.
+#
+# TX MODE (opt-in, entirely additive): pass acm_cert_source: tx to build the
+# TX-clients workflow. Client selection then comes from the file
+# playbooks/dns/tx-cloud-cert-vars.yml -> dns_sub_domains (in THIS repo),
+# refresh_certs is ignored for those clients, nodes point at the TX job
+# template, and each node carries the markers the job needs to source its
+# certificate list from the TX repo. Without acm_cert_source: tx nothing
+# below changes and the production run behaves exactly as before.
+- name: Reset AWS consolidated cert workflow facts
+  set_fact:
+    aws_cert_envs: []
+    aws_cert_workflow_nodes: []
+    awx_workflow_certs_aws: []
+    acm_tx_mode: "{{ (acm_cert_source | default('')) == 'tx' }}"
+
+# Step 0 (TX mode only) — read the TX client list from the manifest file
+# that lives alongside this generator in gcp-shared-services.
+- name: Load TX client list from tx-cloud-cert-vars.yml
+  set_fact:
+    acm_tx_clients: "{{ (lookup('file', acm_tx_vars_file_path) | from_yaml).dns_sub_domains | default([]) }}"
+  vars:
+    acm_tx_vars_file_path: >-
+      {{ acm_tx_vars_file
+         | default((base_src | default('/runner/project')) ~ '/playbooks/dns/tx-cloud-cert-vars.yml', true) }}
+  when: acm_tx_mode | bool
+
+- name: Print TX client list
+  debug:
+    msg: "TX clients from manifest: {{ acm_tx_clients | default([]) }}"
+  when: acm_tx_mode | bool
+
+# Step 1 — Discover every AWS client-env opted into cert renewal
+- name: Discover AWS client environments with refresh_certs enabled
+  set_fact:
+    aws_cert_envs: "{{ aws_cert_envs + [env_entry] }}"
+  with_community.general.filetree: "{{ hclnow_config_client_env }}"
+  loop_control:
+    loop_var: env
+    label: "{{ env.path }} <{{ env.state }}>"
+  when:
+    - env.state == "directory"
+    - env.path.split('/') | length == 2
+    - aws_env_file is exists
+    # TEST/MAINTENANCE OVERRIDE (inert in production — only active when
+    # passed as an extra var): acm_test_ignore_refresh_flag=true lets
+    # WHITELISTED envs in even when their refresh_certs flag is false/absent.
+    # Deliberately inert unless acm_cert_env_whitelist is also defined, so it
+    # can never widen production scope.
+
+    # NOTE: refresh_certs is a GENERATOR-side flag only. Inside the job, the
+    # cert-import include is gated on `certificates | length > 0` — an env
+    # with no certificates configured runs as a no-op and publishes an EMPTY
+    # report (fallback task in awsacmcertimportauto.yml), which is correct.
+    # CAUTION: whitelisted envs that DO have certificates run the REAL cert
+    # logic — a cert within its renewal threshold gets re-imported to ACM.
+    # TX MODE: the TX clients have no refresh_certs var in the config repo —
+    # their opt-in IS membership of dns_sub_domains, so the flag is bypassed
+    # for them (and only for them).
+    - >-
+      (refresh_cert | bool)
+      or ((acm_test_ignore_refresh_flag | default(false) | bool)
+          and (acm_cert_env_whitelist is defined))
+      or ((acm_tx_mode | default(false) | bool)
+          and (awx_client_code in (acm_tx_clients | default([]))))
+
+    # TEST/MAINTENANCE OVERRIDE: optional whitelist to limit scope (test
+    # towers, emergency scope-reduction, or building team-scoped workflows).
+    # Each entry may be EITHER a whole client ("hxtx" = all of hxtx's envs)
+    # OR a single env ("hxtx/np" = just that env). Filtering at discovery
+    # keeps nodes, chain links, and the digest's expected_reports manifest
+    # consistent with each other.
+    # Example (whole clients): -e '{"acm_cert_env_whitelist": ["hxtx","mosa","txle"]}'
+    # Example (specific envs):  -e '{"acm_cert_env_whitelist": ["hxtx/np","hxsa/awsv9m"]}'
+    # Leave UNDEFINED in production to include everything.
+    # IMPORTANT: a whitelist alone rebuilds the SAME workflow with fewer
+    # clients. To build a SEPARATE workflow, ALSO pass acm_workflow_name_override
+    # (Step 4) — otherwise you shrink the main production workflow.
+    - >-
+      (acm_cert_env_whitelist is not defined)
+      or (env.path in acm_cert_env_whitelist)
+      or (awx_client_code in acm_cert_env_whitelist)
+
+    # TX MODE: in TX mode keep ONLY the TX clients. In normal (production)
+    # mode, optionally SUBTRACT them so a stray refresh_certs: true on a TX
+    # env can never put it in both workflows.
+    # NOTE: the exclusion is OPT-IN (acm_tx_exclude_from_main: true) because
+    # dns_sub_domains currently contains 'hxsa' "for testing only" — enabling
+    # it today would drop hxsa out of the MAIN production workflow. Turn it on
+    # once the TX list contains only genuine TX clients.
+    - >-
+      (acm_tx_mode | default(false) | bool)
+      | ternary(
+          awx_client_code in (acm_tx_clients | default([])),
+          not ((acm_tx_exclude_from_main | default(false) | bool)
+               and (awx_client_code in (acm_tx_clients | default([]))))
+        )
+  vars:
+    awx_client_code: "{{ env.path.split('/')[0] }}"
+    awx_client_env: "{{ env.path.split('/')[1] }}"
+    aws_env_file: "{{ hclnow_config_client_env }}/{{ env.path }}/aws-client-vars-env.yml"
+    default_path: "{{ hclnow_config_client_env }}/{{ awx_client_code }}/aws-client-vars.yml"
+
+    # Custom-delimiter template trick (same as awx-workflow-certs.yml) on
+    # BOTH lookups so regular {{ }} vars inside the client files (e.g.
+    # {{ client_env_base }} in aws-client-vars.yml) pass through unrendered
+    # instead of raising 'undefined variable' during discovery.
+    env_file_vars: "{{ lookup('template', aws_env_file, errors='ignore', variable_start_string='[%', variable_end_string='%]') | from_yaml | default({}, true) }}"
+    default_file_vars: "{{ lookup('template', default_path, errors='ignore', variable_start_string='[%', variable_end_string='%]') | from_yaml | default({}, true) }}"
+    refresh_cert: "{{ env_file_vars.refresh_certs | default(false) }}"
+    awx_infra_code: "{{ env_file_vars.client_infra_type | default(default_file_vars.client_infra_type | default(none)) }}"
+
+    env_entry:
+      client: "{{ awx_client_code }}"
+      env: "{{ awx_client_env }}"
+      infra_code: "{{ awx_infra_code }}"
+
+- name: Print discovered AWS cert client-envs
+  debug:
+    msg: "{{ aws_cert_envs }}"
+
+# Step 2 — Build per-client chained nodes, all converging on the digest node.
+# Node identifier: node-<client>-<env>. Within a client, each env node
+# always-links to the next env; the last env always-links to node-digest-report.
+- name: Build per-client chained workflow nodes
+  set_fact:
+    aws_cert_workflow_nodes: >-
+      {%- set nodes = [] -%}
+      {%- set tickets = awx_renew_certs_tickets | default({}) -%}
+      {%- for client, envs in aws_cert_envs | sort(attribute='client') | groupby('client') -%}
+      {%-   set env_list = envs | sort(attribute='env') -%}
+      {%-   for e in env_list -%}
+      {%-     if loop.last -%}
+      {%-       set next_ident = 'node-digest-report' -%}
+      {%-     else -%}
+      {%-       set next_ident = 'node-' ~ e.client ~ '-' ~ env_list[loop.index].env -%}
+      {%-     endif -%}
+      {%-     set node = {
+                'identifier': 'node-' ~ e.client ~ '-' ~ e.env,
+                'inventory': 'inventory_client_' ~ e.client ~ '_' ~ e.env,
+                'unified_job_template': {'name': acm_jt_name, 'type': 'job_template'},
+                'extra_data': {
+                  'prod_ticket': tickets.get(e.client, {}).get(e.infra_code, ''),
+                  'infra_code': e.infra_code,
+                  'now_cloud': 'aws',
+                  'acm_report_client': e.client,
+                  'acm_report_env': e.env
+                },
+                'related': {'always_nodes': [next_ident]}
+              } -%}
+      {#-     TX MODE: tell the job to source `certificates` from the TX repo
+              instead of tools.yml, and (phase 1) keep the run read-only. -#}
+      {%-     if acm_tx_mode | default(false) | bool -%}
+      {%-       set node = node | combine({'extra_data':
+                  node.extra_data | combine({
+                    'acm_certs_source': 'tx',
+                    'acm_tx_dns_file': acm_tx_dns_file_resolved,
+                    'acm_report_only': acm_report_only | default(true)
+                  })
+                }) -%}
+      {%-     endif -%}
+      {#-     PRODUCTION: nodes run the JT's default SCM branch. Pass
+              acm_scm_branch_override as an extra var to pin a test branch
+              (as was done during the PoC with sum-cert-alert-aws). -#}
+      {%-     if acm_scm_branch_override is defined -%}
+      {%-       set node = node | combine({'scm_branch': acm_scm_branch_override}) -%}
+      {%-     endif -%}
+      {%-     set _ = nodes.append(node) -%}
+      {%-   endfor -%}
+      {%- endfor -%}
+      {{ nodes }}
+  vars:
+    # TX mode swaps in the TX-specific job template so the TX team can be
+    # granted Execute on it without touching the DevOps-owned JT.
+    acm_jt_name: >-
+      {{ (acm_tx_mode | default(false) | bool)
+         | ternary(acm_tx_job_template | default('Import Certificate to ACM in AWS - TX'),
+                   'Import Certificate to ACM in AWS') }}
+    # Which combined DNS file the TX jobs read. Defaults to the prod file;
+    # point at hclsoftware-cloud-dns-test.yml for a test run. Per-client-env
+    # file selection is a phase-2 item (see the env-mapping question).
+    acm_tx_dns_file_resolved: >-
+      {{ acm_tx_dns_file
+         | default((base_src | default('/runner/project')) ~ '/hclnow-client-hxtx/hclsoftware-cloud-dns-prod.yml', true) }}
+  when: aws_cert_envs | length > 0
+
+# Step 3 — Append the digest convergence node.
+# extra_data.expected_reports is the manifest the digest playbook uses to
+# detect branches that died before publishing an artifact.
+- name: Append digest report convergence node
+  set_fact:
+    aws_cert_workflow_nodes: "{{ aws_cert_workflow_nodes + [digest_node] }}"
+  vars:
+    digest_node:
+      identifier: node-digest-report
+      all_parents_must_converge: true
+      # This inventory must EXIST in AWX (node creation resolves it by name)
+      # but its CONTENTS are irrelevant: acm-cert-digest.yml targets implicit
+      # localhost on the EE, so no client hosts are touched. Any existing
+      # inventory works; override via acm_digest_inventory if the default
+      # name is absent on your tower. Keep the digest JT's Limit field EMPTY.
+      inventory: "{{ acm_digest_inventory | default('Localhost-HCLNOW-DevOps') }}"
+      # CREATION-ONLY TEST PREREQ #1: AWX resolves this job template BY NAME
+      # at workflow-creation time — create the 'ACM Certs Digest Report' JT
+      # first (a stub pointing at any playbook is enough for the creation
+      # test), or node creation fails and leaves a half-built workflow.
+      unified_job_template:
+        name: 'ACM Certs Digest Report'
+        type: 'job_template'
+      extra_data:
+        expected_reports: "{{ aws_cert_envs }}"
+  when: aws_cert_envs | length > 0
+
+- name: Print consolidated workflow nodes
+  debug:
+    msg: "{{ aws_cert_workflow_nodes }}"
+  when: aws_cert_workflow_nodes | length > 0
+
+# Step 4 — Build the single workflow object (same schema the per-client
+# generator feeds into awx-create-workflow.yml / awx-create-schedule.yml).
+#
+# SEPARATE / SCOPED WORKFLOW: pass acm_workflow_name_override (+ a whitelist,
+# Step 1) to build a distinct workflow for a subset of clients. The name
+# override makes it its own AWX object, so the main "renew certs - aws - all
+# clients" workflow is left untouched.
+- name: Prepare consolidated AWS certs workflow template
+  set_fact:
+    awx_workflow_certs_aws:
+      # TX mode gets its own default name, so it can never overwrite the main
+      # workflow even if acm_workflow_name_override is forgotten.
+      - name: >-
+          {{ acm_workflow_name_override
+             | default((acm_tx_mode | default(false) | bool)
+                       | ternary('renew certs - aws - tx clients',
+                                 'renew certs - aws - all clients'), true) }}
+        organization: "{{ default_support_org }}"
+        ask_inventory_on_launch: false
+        ask_scm_branch_on_launch: false
+        state: present
+        description: >-
+          Consolidated AWS cert renewal{{
+            (' — ' ~ acm_workflow_name_override) if acm_workflow_name_override is defined
+            else ' across all clients'
+          }}. One branch per client (envs sequential), converging on a single
+          digest email. Driven by var refresh_certs in aws-client-vars-env.yml.
+          Scheduled daily.
+        workflow_nodes: "{{ aws_cert_workflow_nodes }}"
+        # Schedule name is per-workflow; a scoped workflow gets its own
+        # schedule object of the same name. Override with acm_schedule_override
+        # if your tower requires globally-unique schedule names.
+        schedule: ["{{ acm_schedule_override | default('Runs daily certs') }}"]
+        allow_simultaneous: false
+  when: aws_cert_workflow_nodes | length > 1
+
+# Step 4b — opt-in clean rebuild: delete the workflow being built BEFORE
+# rebuilding it, so nodes+links are recreated from scratch (recovers from a
+# half-built/linkless workflow left by an aborted earlier run). Targets the
+# SAME name Step 4 builds, so with acm_workflow_name_override it deletes the
+# scoped workflow, and without it the main one.
+#   - clean-rebuild a scoped workflow: acm_workflow_name_override + whitelist + acm_test_workflow_delete: true
+#   - (the leftover PoC "TEST renew certs - aws - all clients" workflow, if any,
+#     is deleted in the AWX UI — it is no longer this task's default target)
+# Inert (skipped) on any run without acm_test_workflow_delete.
+- name: Delete target consolidated workflow before rebuild (opt-in)
+  awx.awx.workflow_job_template:
+    name: >-
+      {{ acm_workflow_name_override
+         | default((acm_tx_mode | default(false) | bool)
+                   | ternary('renew certs - aws - tx clients',
+                             'renew certs - aws - all clients'), true) }}
+    organization: "{{ default_support_org }}"
+    state: absent
+    controller_host: "{{ awx_uri }}"
+    controller_username: "{{ awx_username }}"
+    controller_password: "{{ awx_password }}"
+  when: acm_test_workflow_delete | default(false) | bool
+
+# Step 5 — Create the workflow in AWX
+- name: Create consolidated AWS certs workflow
+  include_tasks:
+    file: awx-create-workflow.yml
+  loop: "{{ awx_workflow_certs_aws | list }}"
+  loop_control:
+    loop_var: job
+    label: "{{ job.name }}"
+  when:
+    - awx_workflow_certs_aws is defined
+    - awx_workflow_certs_aws | length > 0
+
+# Step 6 — Schedule it
+- name: Schedule consolidated AWS certs workflow
+  include_tasks:
+    file: awx-create-schedule.yml
+  loop: "{{ awx_workflow_certs_aws | list }}"
+  loop_control:
+    loop_var: job
+    label: "{{ job.name }}"
+  when:
+    - awx_workflow_certs_aws is defined
+    - awx_workflow_certs_aws | length > 0
