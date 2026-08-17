@@ -66,6 +66,15 @@ acm_tx_dns_env: "test"                          # hxsa records are in the test f
 acm_workflow_name_override: "TEST renew certs - aws - tx clients"
 acm_test_workflow_delete: true                  # clean rebuild
 acm_scm_branch_override: "<your test branch>"   # TX nodes run your branch
+
+awx_type: awx_test
+acm_cert_source: tx
+acm_tx_job_template: "Import Certificate to ACM in AWS"   # reuse existing JT --> about this its not required right as by default our generator picks this JT
+acm_cert_env_whitelist: ["hxsa/awsv9m"]
+acm_tx_dns_env: "test"
+acm_workflow_name_override: "TEST renew certs - aws - tx clients"
+acm_test_workflow_delete: false ---> because i dont want to delete existing Workflow
+acm_scm_branch_override: "sum-cert-alert-aws" 
 ```
 
 Expected result: a workflow with a single `node-hxsa-awsv9m` branch converging
@@ -146,13 +155,3 @@ domains with no imported ACM certificate show as `not_found_in_acm`.
    enabling it today would drop hxsa from the main production workflow.
 4. **Digest recipients** — TX workflow currently emails the standard cert
    group. Add the TX team's address once confirmed.
-
-
-awx_type: awx_test
-acm_cert_source: tx
-acm_tx_job_template: "Import Certificate to ACM in AWS"   # reuse existing JT --> about this its not required right as by default our generator picks this JT
-acm_cert_env_whitelist: ["hxsa/awsv9m"]
-acm_tx_dns_env: "test"
-acm_workflow_name_override: "TEST renew certs - aws - tx clients"
-acm_test_workflow_delete: false ---> because i dont want to delete existing Workflow
-acm_scm_branch_override: "sum-cert-alert-aws" 
