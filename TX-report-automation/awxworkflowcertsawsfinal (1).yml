@@ -57,20 +57,55 @@
     awx_workflow_certs_aws: []
     acm_tx_mode: "{{ (acm_cert_source | default('')) == 'tx' }}"
 
-# Step 0 (TX mode only) — read the TX client list from the manifest file
-# that lives alongside this generator in gcp-shared-services.
-- name: Load TX client list from tx-cloud-cert-vars.yml
+# Step 0 (TX mode only) — read the client group from the central mapping:
+#   gcp-shared-services/playbooks/awx/kube/common/vars/client-mapping.yml
+#
+#   client_parent:
+#     tx:
+#       git_project: hclnow-client-hxtx
+#       clients: [hxtx, mosa, txle, hxsa]   # hxsa = testing only
+#
+# If the init playbook already loaded that file, `client_parent` is in scope and
+# is used as-is; otherwise it is read from disk. Group key is acm_tx_parent
+# (default 'tx'), so other parent groups can reuse this path later.
+- name: Load client mapping for the TX group
   set_fact:
-    acm_tx_clients: "{{ (lookup('file', acm_tx_vars_file_path) | from_yaml).dns_sub_domains | default([]) }}"
+    acm_client_parent: >-
+      {{ client_parent
+         | default((lookup('file', acm_client_mapping_path) | from_yaml).client_parent | default({}), true) }}
   vars:
-    acm_tx_vars_file_path: >-
-      {{ acm_tx_vars_file
-         | default((base_src | default('/runner/project')) ~ '/playbooks/dns/tx-cloud-cert-vars.yml', true) }}
+    acm_client_mapping_path: >-
+      {{ acm_client_mapping_file
+         | default((base_src | default('/runner/project'))
+                   ~ '/playbooks/awx/kube/common/vars/client-mapping.yml', true) }}
   when: acm_tx_mode | bool
 
-- name: Print TX client list
+- name: Resolve TX client list and git project from the mapping
+  set_fact:
+    acm_tx_clients: "{{ acm_tx_group.clients | default([]) }}"
+    acm_tx_git_project: "{{ acm_tx_group.git_project | default('') }}"
+  vars:
+    acm_tx_group: "{{ acm_client_parent[acm_tx_parent | default('tx')] | default({}) }}"
+  when: acm_tx_mode | bool
+
+# Fail loudly rather than silently building an empty/incomplete workflow if the
+# mapping file moved or its keys were renamed.
+- name: Assert the TX group resolved
+  assert:
+    that:
+      - acm_tx_clients | length > 0
+      - acm_tx_git_project | length > 0
+    fail_msg: >-
+      Could not resolve client_parent['{{ acm_tx_parent | default("tx") }}']
+      (clients + git_project) from the client mapping. Check the path/keys in
+      common/vars/client-mapping.yml, or override acm_client_mapping_file.
+  when: acm_tx_mode | bool
+
+- name: Print resolved TX group
   debug:
-    msg: "TX clients from manifest: {{ acm_tx_clients | default([]) }}"
+    msg: >-
+      TX group '{{ acm_tx_parent | default('tx') }}':
+      clients={{ acm_tx_clients }}, git_project={{ acm_tx_git_project }}
   when: acm_tx_mode | bool
 
 # Step 1 — Discover every AWS client-env opted into cert renewal
@@ -219,12 +254,16 @@
       {{ (acm_tx_mode | default(false) | bool)
          | ternary(acm_tx_job_template | default('Import Certificate to ACM in AWS - TX'),
                    'Import Certificate to ACM in AWS') }}
-    # Which combined DNS file the TX jobs read. Defaults to the prod file;
-    # point at hclsoftware-cloud-dns-test.yml for a test run. Per-client-env
-    # file selection is a phase-2 item (see the env-mapping question).
+    # Which combined DNS file the TX jobs read. The repo directory comes from
+    # the mapping's git_project. Switch files with acm_tx_dns_env (test|prod),
+    # or override the whole path with acm_tx_dns_file.
+    # NOTE: this path is resolved inside the JOB's checkout, so git_project
+    # must be a submodule of aws-v9-automation. Per-client-env file selection
+    # is a phase-2 item (see the env-mapping question).
     acm_tx_dns_file_resolved: >-
       {{ acm_tx_dns_file
-         | default((base_src | default('/runner/project')) ~ '/hclnow-client-hxtx/hclsoftware-cloud-dns-prod.yml', true) }}
+         | default((base_src | default('/runner/project')) ~ '/' ~ acm_tx_git_project
+                   ~ '/hclsoftware-cloud-dns-' ~ (acm_tx_dns_env | default('prod')) ~ '.yml', true) }}
   when: aws_cert_envs | length > 0
 
 # Step 3 — Append the digest convergence node.
