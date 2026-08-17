@@ -13,7 +13,7 @@ generator and the cert playbook behave exactly as they do in production today.
 
 | File | Change |
 |---|---|
-| `awxworkflowcertsaws-final.yml` (generator) | New **TX mode**: `acm_cert_source: tx` reads the client list from `playbooks/dns/tx-cloud-cert-vars.yml` → `dns_sub_domains`, bypasses `refresh_certs` for those clients only, points nodes at the TX job template, defaults the workflow name to `renew certs - aws - tx clients`, and injects `acm_certs_source` / `acm_tx_dns_file` / `acm_report_only` into each node |
+| `awxworkflowcertsaws-final.yml` (generator) | New **TX mode**: `acm_cert_source: tx` reads the group from `playbooks/awx/kube/common/vars/client-mapping.yml` → `client_parent.tx.{clients,git_project}`, bypasses `refresh_certs` for those clients only, points nodes at the TX job template, defaults the workflow name to `renew certs - aws - tx clients`, and injects `acm_certs_source` / `acm_tx_dns_file` / `acm_report_only` into each node |
 | `aws-acm-cert-import-auto.yml` (parent playbook) | New gated block **before** the cert include that builds `certificates` from the TX DNS file (domain + derived secret name + `hclnow-certs` namespace) |
 | `awscertimport.yml` (cert engine) | **No change** — see the one-line read-only guard below |
 
@@ -37,6 +37,43 @@ generator and the cert playbook behave exactly as they do in production today.
    The generator sets `acm_report_only: true` on TX nodes in Phase 1, so this
    guarantees no k8s secret pull and no ACM import even if a TX cert is inside
    its renewal window. Default `false` ⇒ zero change for every other client.
+
+## Source files this reads
+
+| File | Provides | Read by |
+|---|---|---|
+| `playbooks/awx/kube/common/vars/client-mapping.yml` | `client_parent.tx.clients` (client list) and `client_parent.tx.git_project` (TX repo dir) | generator |
+| `playbooks/dns/cloud-cert-vars.yml` | `namespace` (secret namespace), `valid_suffix` | job |
+| `<git_project>/hclsoftware-cloud-dns-<test\|prod>.yml` | `dns:` records, combined across TX clients | job (path passed by the generator) |
+
+Override any of them with `acm_client_mapping_file`, `acm_tx_vars_file`,
+`acm_tx_dns_file` / `acm_tx_dns_env`. If the init playbook already loads the
+mapping, the in-scope `client_parent` var is used and no file read happens.
+
+## First test — hxsa on the test tower
+
+`hxsa` is in the TX client list for exactly this purpose, and its test records
+live in the **test** DNS file (e.g. `cname-autotest.hxsa.now.hclsoftware.cloud.`
+→ secret `cname-autotest-tls`). On a test tower the other TX clients' inventories
+usually don't exist, and a missing inventory aborts the build before links are
+created — so scope the run to hxsa:
+
+```yaml
+awx_type: <your usual value>
+acm_cert_source: tx
+acm_cert_env_whitelist: ["hxsa/awsv9m"]        # only this env
+acm_tx_dns_env: "test"                          # hxsa records are in the test file
+acm_workflow_name_override: "TEST renew certs - aws - tx clients"
+acm_test_workflow_delete: true                  # clean rebuild
+acm_scm_branch_override: "<your test branch>"   # TX nodes run your branch
+```
+
+Expected result: a workflow with a single `node-hxsa-awsv9m` branch converging
+on the digest node, that node's extra_data carrying `acm_certs_source: tx`,
+`acm_tx_dns_file` ending in `-test.yml`, and `acm_report_only: true`.
+
+Then widen: drop the whitelist (or list the other TX clients) once their
+inventories exist on the tower you're testing against.
 
 ## Build the TX workflow
 
