@@ -112,10 +112,14 @@
     #
     # Inputs (from the TX workflow node's extra_data, with defaults):
     #   acm_certs_source : 'tx' switches this on
-    #   acm_tx_vars_file : gcp-shared-services/playbooks/dns/tx-cloud-cert-vars.yml
+    #   acm_tx_vars_file : gcp-shared-services/playbooks/dns/cloud-cert-vars.yml
     #                      -> namespace (secret_namespace), valid_suffix
-    #   acm_tx_dns_file  : hclnow-client-hxtx/hclsoftware-cloud-dns-<env>.yml
-    #                      -> dns: [] records, combined across TX clients
+    #                      (renamed from tx-cloud-cert-vars.yml; the client list
+    #                       now lives in common/vars/client-mapping.yml and is
+    #                       read by the generator, not here)
+    #   acm_tx_dns_file  : <git_project>/hclsoftware-cloud-dns-<env>.yml
+    #                      -> dns: [] records, combined across TX clients;
+    #                      the generator resolves and passes this path
     #
     # Derivation per DNS record (validated against the test + prod files):
     #   dns_full_name "qa-custa.hxtx.now.hclsoftware.cloud."
@@ -132,7 +136,7 @@
       vars:
         acm_tx_vars_file: >-
           {{ acm_tx_vars_file
-             | default(base_src ~ '/gcp-shared-services/playbooks/dns/tx-cloud-cert-vars.yml', true) }}
+             | default(base_src ~ '/gcp-shared-services/playbooks/dns/cloud-cert-vars.yml', true) }}
       when: (acm_certs_source | default('')) == 'tx'
       tags: certs
 
@@ -142,7 +146,8 @@
       vars:
         acm_tx_dns_file: >-
           {{ acm_tx_dns_file
-             | default(base_src ~ '/hclnow-client-hxtx/hclsoftware-cloud-dns-prod.yml', true) }}
+             | default(base_src ~ '/' ~ (acm_tx_git_project | default('hclnow-client-hxtx'))
+                       ~ '/hclsoftware-cloud-dns-' ~ (acm_tx_dns_env | default('prod')) ~ '.yml', true) }}
       when: (acm_certs_source | default('')) == 'tx'
       tags: certs
 
