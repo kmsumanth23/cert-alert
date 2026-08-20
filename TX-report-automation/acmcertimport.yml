@@ -70,6 +70,19 @@
   tags:
     - certs
 
+# Immediate-alert recipients, chosen by client group — same lookup the digest
+# uses. The workflow node passes acm_cert_group (e.g. 'tx'); when it is absent
+# (every non-TX client, and ad-hoc runs) this resolves to smtp_emails_certs and
+# behaviour is unchanged. This is why ONE cert playbook serves all groups:
+# a separate aws-cert-import-tx.yml is not needed.
+- name: Resolve immediate-alert recipients for this client group
+  set_fact:
+    cert_alert_recipients: >-
+      {{ (smtp_emails_certs_by_group | default({}))[acm_cert_group | default('')]
+         | default(smtp_emails_certs, true) }}
+  tags:
+    - certs
+
 - name: Define renewal threshold (in days)
   set_fact:
     renewal_days_threshold: "{{ client_cert_expiry_notice }}"
@@ -277,7 +290,7 @@
     username: "{{ smtp_auth_user }}"
     password: "{{ smtp_auth_pswd }}"
     sender: "{{ smtp_default_sender }}"
-    to: "{{ smtp_emails_certs }}"
+    to: "{{ cert_alert_recipients }}"
     cc: "{{ cloudops_group_emails }}"
     subject: "Error!!! {{ item }} chain verification failed - ACM import skipped"
     body: >-
@@ -391,7 +404,7 @@
     username: "{{ smtp_auth_user }}"
     password: "{{ smtp_auth_pswd }}"
     sender: "{{ smtp_default_sender }}"
-    to: "{{ smtp_emails_certs }}"
+    to: "{{ cert_alert_recipients }}"
     cc: "{{ cloudops_group_emails }}"
     subject: "Error!!! {{ item.key }} import failed"
     body: "{{ lookup('template', 'manual_cert_mail_content.txt.j2') }}"
