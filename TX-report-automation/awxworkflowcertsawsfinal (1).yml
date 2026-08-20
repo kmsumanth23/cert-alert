@@ -289,8 +289,10 @@
       unified_job_template:
         name: 'ACM Certs Digest Report'
         type: 'job_template'
-      extra_data:
-        expected_reports: "{{ aws_cert_envs }}"
+      extra_data: >-
+        {{ {'expected_reports': aws_cert_envs}
+           | combine({'acm_cert_group': (acm_tx_parent | default('tx'))}
+                     if (acm_tx_mode | default(false) | bool) else {}) }}
   when: aws_cert_envs | length > 0
 
 - name: Print consolidated workflow nodes
