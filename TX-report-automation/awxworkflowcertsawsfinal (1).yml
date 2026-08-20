@@ -233,7 +233,8 @@
                   node.extra_data | combine({
                     'acm_certs_source': 'tx',
                     'acm_tx_dns_file': acm_tx_dns_file_resolved,
-                    'acm_report_only': acm_report_only | default(true)
+                    'acm_report_only': acm_report_only | default(true),
+                    'acm_cert_group': acm_tx_parent | default('tx')
                   })
                 }) -%}
       {%-     endif -%}
