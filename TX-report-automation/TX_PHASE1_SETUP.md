@@ -155,3 +155,37 @@ domains with no imported ACM certificate show as `not_found_in_acm`.
    enabling it today would drop hxsa from the main production workflow.
 4. **Digest recipients** — TX workflow currently emails the standard cert
    group. Add the TX team's address once confirmed.
+
+```yml
+   ---
+# SNIPPET for aws-client-vars-base.yml — not a complete file.
+# Add smtp_emails_certs_by_group next to the existing smtp_emails_certs.
+
+# ACM certificate list to check/renew overridden in client env tools.yml
+certificates: []
+
+# Default recipients — unchanged. Used by:
+#   * every immediate alert (import failure / chain-verify failure)
+#   * the digest of any workflow that does NOT pass acm_cert_group
+smtp_emails_certs: >-
+  existing-cert-group@hcl.com
+
+# Per-client-group digest recipients, keyed to match client_parent in
+# common/vars/client-mapping.yml. The workflow's digest node passes
+# acm_cert_group (e.g. 'tx'); the digest playbook then uses:
+#
+#   smtp_emails_certs_by_group[acm_cert_group] | default(smtp_emails_certs)
+#
+# so an unlisted or absent group silently falls back to the default list.
+#
+# TX policy: the TX team acts on alerts, the current cert group is kept on
+# the list for monitoring — so BOTH addresses belong here.
+smtp_emails_certs_by_group:
+  tx: >-
+    tx-team@hcl.com,existing-cert-group@hcl.com
+
+# NOTE: immediate failure alerts inside the cert job still use
+# smtp_emails_certs — they are per-cert and fire before the digest node
+# exists. If TX hard failures should also page the TX team directly, that is
+# a separate change in tasks/aws-cert-import.yml (the two `mail:` tasks).
+```
