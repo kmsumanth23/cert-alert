@@ -1,0 +1,221 @@
+---
+# cert-manager install / upgrade — cloud agnostic.
+#
+#   chart   : internal GCS bucket (gss-bucket-image-repo)
+#   images  : internal registry ({{ tools_image_registry }})
+#   version : clients/<code>/<env>/tools.yml, falling back to addon defaults
+#
+# Called from <cloud>-automation/vsi-bastion-setup.yml via the shared-services
+# submodule. Keep all cloud-specific values in the calling repo.
+#
+# Tag at the include site, not per task, so partial runs stay coherent:
+#     - ansible.builtin.include_tasks:
+#         file: "{{ base_src_infra_provision }}/clouds-common/tasks/vsi-install-cert-manager.yml"
+#         apply:
+#           tags: cert-manager
+#       tags: cert-manager
+
+- name: Set source infrastructure path for AWX execution environment
+  ansible.builtin.set_fact:
+    base_src_infra_provision: "/runner/project/gcp-shared-services"
+  when: awx_virtualization_type == "container"
+
+- name: Include addon default variables
+  ansible.builtin.include_vars:
+    file: "{{ base_src_infra_provision }}/clouds-common/addons/defaults/main.yml"
+
+- name: Resolve cert-manager paths for this client environment
+  ansible.builtin.set_fact:
+    cert_manager_tools_file: >-
+      {{ base_config_client_env }}/clients/{{ client_code }}/{{ client_env }}/tools.yml
+    cert_manager_stage_dir: "/apps/{{ client_code }}/{{ client_env }}/utils/cert-manager"
+
+# ─── Version resolution: tools.yml overrides the addon default ──────────────
+# Precedence is explicit here rather than relying on Ansible's include_vars
+# level, which sits *above* group_vars and would silently win.
+
+- name: Check whether the client environment defines a tools.yml
+  ansible.builtin.stat:
+    path: "{{ cert_manager_tools_file }}"
+  delegate_to: localhost
+  run_once: true
+  register: cert_manager_tools_stat
+
+- name: Load the client environment tools configuration
+  ansible.builtin.include_vars:
+    file: "{{ cert_manager_tools_file }}"
+    name: cert_manager_tools          # namespaced, so no key collisions
+  when: cert_manager_tools_stat.stat.exists
+
+- name: Select the cert-manager entry from the tools configuration
+  ansible.builtin.set_fact:
+    cert_manager_tools_entry: >-
+      {{ (cert_manager_tools.cert_manager_resources | default([]))
+         | selectattr('desc', 'equalto', 'custom_cert_manager_version')
+         | list | first | default({}) }}
+
+# tools.yml may carry "1.21.1" or "v1.21.1"; the tarball and image tags
+# always want the v-prefixed form.
+- name: Determine the cert-manager version to deploy
+  ansible.builtin.set_fact:
+    cert_manager_version: >-
+      v{{ (cert_manager_tools_entry.version | default(cert_manager_chart_version))
+          | regex_replace('^v', '') }}
+    cert_manager_update_allowed: >-
+      {{ cert_manager_tools_entry.update | default(false) | bool }}
+
+- name: Query the currently installed cert-manager release
+  kubernetes.core.helm_info:
+    name: cert-manager
+    release_namespace: cert-manager
+    kubeconfig: "{{ cert_manager_kubeconfig | default(omit) }}"
+  register: cert_manager_release
+
+- name: Classify the required cert-manager action
+  ansible.builtin.set_fact:
+    cert_manager_installed_version: >-
+      {{ cert_manager_release.status.chart | default('')
+         | regex_replace('^cert-manager-', '') }}
+  # chart name renders as "cert-manager-v1.21.1"; empty when not installed
+
+- name: Compare the installed and desired cert-manager versions
+  ansible.builtin.set_fact:
+    cert_manager_action: >-
+      {%- set have = cert_manager_installed_version | regex_replace('^v', '') -%}
+      {%- set want = cert_manager_version | regex_replace('^v', '') -%}
+      {%- if have | length == 0 -%}install
+      {%- elif have == want -%}none
+      {%- elif want is version(have, '>') -%}upgrade
+      {%- else -%}downgrade
+      {%- endif -%}
+
+- name: Report the cert-manager version state
+  ansible.builtin.debug:
+    msg: >-
+      cert-manager: installed={{ cert_manager_installed_version | default('none', true) }}
+      desired={{ cert_manager_version }}
+      action={{ cert_manager_action }}
+      {{ '(gated: set update: true in tools.yml to apply)'
+         if cert_manager_action in ['upgrade', 'downgrade']
+            and not cert_manager_update_allowed else '' }}
+
+- name: Warn that a cert-manager version change is pending but not authorised
+  ansible.builtin.debug:
+    msg: >-
+      SKIPPING cert-manager {{ cert_manager_action }}
+      {{ cert_manager_installed_version }} -> {{ cert_manager_version }}.
+      tools.yml pins a different version but does not set "update: true",
+      so the running release is left untouched.
+  when:
+    - cert_manager_action in ['upgrade', 'downgrade']
+    - not cert_manager_update_allowed
+
+# ─── Namespace and pull secret: maintained on every run ────────────────────
+# Kept outside the deploy gate so rotated registry credentials are refreshed
+# even when the version is already correct.
+
+- name: Ensure the cert-manager namespace exists
+  kubernetes.core.k8s:
+    api_version: v1
+    kind: Namespace
+    name: cert-manager
+    state: present
+    kubeconfig: "{{ cert_manager_kubeconfig | default(omit) }}"
+
+# lookup() is evaluated on the controller (the AWX EE) regardless of
+# delegation — this is where hclsw-imagerepo.json lives.
+- name: Fetch image-repo credentials from bucket
+  ansible.builtin.include_tasks:
+    file: "{{ base_src_infra_provision }}/clouds-common/addons/tasks/awx-get-data-bucket.yml"
+    apply:
+      run_once: true
+      delegate_to: localhost
+  vars:
+    bucket: hclsw-gss-bucket-auto-files
+    files:
+      - hclsw-imagerepo.json
+  when: awx_virtualization_type == "container"
+
+- name: Set the imagerepo json fact
+  ansible.builtin.set_fact:
+    imgrepo_jsn: "{{ lookup('file', data_private_dir + '/hclsw-imagerepo.json') }}"
+  delegate_to: localhost      # decorative: the lookup reads from the EE either way
+  no_log: true
+
+- name: Create docker secret for cert-manager
+  ansible.builtin.include_tasks:
+    file: "{{ base_src_infra_provision }}/clouds-common/addons/tasks/registry-image-pull-secret.yml"
+  vars:
+    secret_namespace: "cert-manager"
+
+# ─── Stage the chart and deploy ────────────────────────────────────────────
+
+- name: Install or upgrade cert-manager
+  when: >-
+    cert_manager_action == 'install'
+    or (cert_manager_action in ['upgrade', 'downgrade'] and cert_manager_update_allowed)
+  block:
+
+    # Version-scoped so an upgrade never reuses a previously extracted chart.
+    - name: Create the cert-manager staging directory
+      ansible.builtin.file:
+        path: "{{ cert_manager_stage_dir }}/{{ cert_manager_version }}"
+        state: directory
+        mode: "0750"
+
+    - name: Download the cert-manager Helm chart from the internal bucket
+      google.cloud.gcp_storage_object:
+        action: download
+        bucket: gss-bucket-image-repo
+        src: "repo/downloads/cert-manager/cert-manager-{{ cert_manager_version }}.tgz"
+        dest: "{{ cert_manager_stage_dir }}/{{ cert_manager_version }}/cert-manager-{{ cert_manager_version }}.tgz"
+        project: "{{ gss_image_bucket_project }}"
+        auth_kind: serviceaccount
+        service_account_contents: "{{ imgrepo_jsn }}"
+      register: cert_manager_chart_download
+      retries: 3
+      delay: 5
+      until: cert_manager_chart_download is succeeded
+      no_log: true            # keeps the service account key out of the job log
+
+    - name: Unpack the cert-manager Helm chart
+      ansible.builtin.unarchive:
+        src: "{{ cert_manager_stage_dir }}/{{ cert_manager_version }}/cert-manager-{{ cert_manager_version }}.tgz"
+        dest: "{{ cert_manager_stage_dir }}/{{ cert_manager_version }}"
+        remote_src: true
+        creates: "{{ cert_manager_stage_dir }}/{{ cert_manager_version }}/cert-manager/Chart.yaml"
+
+    # Image tags are deliberately unset: the chart derives them from its own
+    # appVersion, which keeps chart and images from drifting apart.
+    - name: Compose cert-manager Helm values
+      ansible.builtin.set_fact:
+        cert_manager_helm_values:
+          imageRegistry: "{{ tools_image_registry }}"
+          imageNamespace: cert-manager
+          global:
+            imagePullSecrets:
+              - name: "{{ image_pull_secret }}"
+          crds:
+            enabled: true
+            keep: true        # never cascade-delete Certificates on uninstall
+
+    - name: "Deploy cert-manager {{ cert_manager_version }} ({{ cert_manager_action }})"
+      kubernetes.core.helm:
+        name: cert-manager
+        chart_ref: "{{ cert_manager_stage_dir }}/{{ cert_manager_version }}/cert-manager"
+        release_namespace: cert-manager
+        create_namespace: false           # created explicitly above
+        state: present                    # install-or-upgrade in one operation
+        kubeconfig: "{{ cert_manager_kubeconfig | default(omit) }}"
+        values: "{{ cert_manager_helm_values }}"
+        wait: true                        # blocks until all deployments are ready
+        wait_timeout: "{{ cert_manager_wait_timeout | default('600s') }}"
+      register: cert_manager_helm_result
+
+    - name: Report the cert-manager deployment result
+      ansible.builtin.debug:
+        msg: >-
+          cert-manager {{ cert_manager_version }}
+          {{ cert_manager_action }}d ->
+          {{ cert_manager_helm_result.status.status | default('unknown') }}
+          (revision {{ cert_manager_helm_result.status.revision | default('?') }})
