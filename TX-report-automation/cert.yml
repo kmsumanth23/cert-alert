@@ -159,6 +159,12 @@
   when: >-
     cert_manager_action == 'install'
     or (cert_manager_action in ['upgrade', 'downgrade'] and cert_manager_update_allowed)
+  become: yes                      # [B] — inherited by every task in the block
+  become_user: root
+  become_method: su
+  become_exe: sudo su -
+  tags:
+    - cert-manager
   block:
 
     # Version-scoped so an upgrade never reuses a previously extracted chart.
