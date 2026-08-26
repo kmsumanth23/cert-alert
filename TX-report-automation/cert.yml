@@ -17,7 +17,7 @@
 
 - name: Set source infrastructure path for AWX execution environment
   ansible.builtin.set_fact:
-    base_src_infra_provision: "/runner/project/gcp-shared-services"
+    base_src_infra_provision: "{{ base_src }}/gcp-shared-services"
   when: awx_virtualization_type == "container"
 
 - name: Include addon default variables
@@ -32,8 +32,7 @@
 - name: Resolve cert-manager paths for this client environment
   ansible.builtin.set_fact:
     cert_manager_tools_file: >-
-      {{ base_src_infra_provision | dirname }}/hclnow-config-client-environments/clients/{{
-         client_code }}/{{ client_env }}/tools.yml
+      {{ client_vars_directory }}/{{ client_code }}/{{ client_env }}/tools.yml
     cert_manager_stage_dir: "/apps/{{ client_code }}/{{ client_env }}/utils/cert-manager"
 
 # ─── Version resolution: tools.yml overrides the addon default ──────────────
