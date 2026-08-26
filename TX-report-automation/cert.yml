@@ -24,10 +24,16 @@
   ansible.builtin.include_vars:
     file: "{{ base_src_infra_provision }}/clouds-common/addons/defaults/main.yml"
 
+# gcp-tools-vars.yml derives client_vars_directory from base_src, which is
+# one level too shallow for the container EE. Derive the config repo root from
+# base_src_infra_provision instead — correct in both container and KVM modes.
+# Once base_src_infra_provision_container is fixed to include the
+# /gcp-shared-services suffix, replace this with client_vars_directory.
 - name: Resolve cert-manager paths for this client environment
   ansible.builtin.set_fact:
     cert_manager_tools_file: >-
-      {{ base_config_client_env }}/clients/{{ client_code }}/{{ client_env }}/tools.yml
+      {{ base_src_infra_provision | dirname }}/hclnow-config-client-environments/clients/{{
+         client_code }}/{{ client_env }}/tools.yml
     cert_manager_stage_dir: "/apps/{{ client_code }}/{{ client_env }}/utils/cert-manager"
 
 # ─── Version resolution: tools.yml overrides the addon default ──────────────
@@ -71,12 +77,12 @@
     kubeconfig: "{{ cert_manager_kubeconfig | default(omit) }}"
   register: cert_manager_release
 
-- name: Classify the required cert-manager action
+# chart name renders as "cert-manager-v1.21.1"; empty when not installed
+- name: Read the installed cert-manager version
   ansible.builtin.set_fact:
     cert_manager_installed_version: >-
       {{ cert_manager_release.status.chart | default('')
          | regex_replace('^cert-manager-', '') }}
-  # chart name renders as "cert-manager-v1.21.1"; empty when not installed
 
 - name: Compare the installed and desired cert-manager versions
   ansible.builtin.set_fact:
@@ -131,7 +137,7 @@
       run_once: true
       delegate_to: localhost
   vars:
-    bucket: hclsw-gss-bucket-auto-files
+    bucket: "{{ data_bucket }}"
     files:
       - hclsw-imagerepo.json
   when: awx_virtualization_type == "container"
