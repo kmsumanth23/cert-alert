@@ -188,4 +188,14 @@ smtp_emails_certs_by_group:
 # smtp_emails_certs — they are per-cert and fire before the digest node
 # exists. If TX hard failures should also page the TX team directly, that is
 # a separate change in tasks/aws-cert-import.yml (the two `mail:` tasks).
+
+# 1. What keys does this chart actually accept?
+helm show values /apps/.../cert-manager | grep -nE '^(image|imageRegistry|imageNamespace|webhook|cainjector):' -A4
+
+# 2. The definitive test — render with your values and look at the image refs
+cat > /tmp/v.yaml <<'EOF'
+imageRegistry: my-internal-registry.example.com
+imageNamespace: cert-manager
+EOF
+helm template cert-manager /apps/.../cert-manager -f /tmp/v.yaml | grep -E '^\s+image:'
 ```
