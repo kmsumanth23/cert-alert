@@ -198,4 +198,6 @@ imageRegistry: my-internal-registry.example.com
 imageNamespace: cert-manager
 EOF
 helm template cert-manager /apps/.../cert-manager -f /tmp/v.yaml | grep -E '^\s+image:'
+
+kubectl get pods -n cert-manager -o jsonpath='{.items[*].spec.containers[*].image}'
 ```
