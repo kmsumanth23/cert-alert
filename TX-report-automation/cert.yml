@@ -69,6 +69,25 @@
     cert_manager_update_allowed: >-
       {{ cert_manager_tools_entry.update | default(false) | bool }}
 
+- name: DEBUG cert-manager kube access
+  ansible.builtin.shell: |
+    echo "user=$(id -un) uid=$(id -u)"
+    echo "HOME=$HOME"
+    echo "KUBECONFIG=${KUBECONFIG:-<unset>}"
+    ls -l /root/.kube/config 2>&1 || echo "cannot stat"
+    head -c 1 /root/.kube/config >/dev/null 2>&1 && echo "readable=yes" || echo "readable=NO"
+    /usr/local/bin/helm list -n cert-manager --kubeconfig /root/.kube/config 2>&1 || true
+  become: yes
+  become_user: root
+  become_method: su
+  become_exe: sudo su -
+  changed_when: false
+  register: cm_debug
+
+- name: DEBUG output
+  ansible.builtin.debug:
+    var: cm_debug.stdout_lines
+
 - name: Query the currently installed cert-manager release
   kubernetes.core.helm_info:
     name: cert-manager
