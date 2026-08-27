@@ -64,10 +64,13 @@
 - name: Determine the cert-manager version to deploy
   ansible.builtin.set_fact:
     cert_manager_version: >-
-      v{{ (cert_manager_tools_entry.version | default(cert_manager_chart_version))
+      v{{ (cert_manager_tools_entry['version'] | default(cert_manager_chart_version))
           | regex_replace('^v', '') }}
     cert_manager_update_allowed: >-
-      {{ cert_manager_tools_entry.update | default(false) | bool }}
+      {{ cert_manager_tools_entry['update'] | default(false) | bool }}
+
+- ansible.builtin.debug:
+    msg: "entry={{ cert_manager_tools_entry }} update_allowed={{ cert_manager_update_allowed }}"
 
 - name: DEBUG cert-manager kube access
   ansible.builtin.shell: |
