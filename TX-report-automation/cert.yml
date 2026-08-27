@@ -88,6 +88,20 @@
   ansible.builtin.debug:
     var: cm_debug.stdout_lines
 
+- name: DEBUG effective user and kubeconfig access
+  ansible.builtin.shell: |
+    echo "user=$(id -un) uid=$(id -u)"
+    head -c 1 /root/.kube/config >/dev/null 2>&1 && echo "readable=yes" || echo "readable=NO"
+  become: yes
+  become_user: root
+  become_method: su
+  become_exe: sudo su -
+  changed_when: false
+  register: cm_debug
+
+- ansible.builtin.debug:
+    var: cm_debug.stdout_lines
+
 - name: Query the currently installed cert-manager release
   kubernetes.core.helm_info:
     name: cert-manager
