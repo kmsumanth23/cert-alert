@@ -11,6 +11,7 @@
     <th style="border:1px solid #d0d0d0;padding:6px 10px;text-align:left;">Domain</th>
     <th style="border:1px solid #d0d0d0;padding:6px 10px;text-align:left;">Expiry (UTC)</th>
     <th style="border:1px solid #d0d0d0;padding:6px 10px;text-align:right;">Days left</th>
+    <th style="border:1px solid #d0d0d0;padding:6px 10px;text-align:center;">In use</th>
     <th style="border:1px solid #d0d0d0;padding:6px 10px;text-align:left;">Status</th>
   </tr>
 {% for row in rows %}
@@ -22,6 +23,10 @@
     <td style="border:1px solid #d0d0d0;padding:6px 10px;">{{ row.domain }}</td>
     <td style="border:1px solid #d0d0d0;padding:6px 10px;">{{ row.not_after | default('-', true) }}</td>
     <td style="border:1px solid #d0d0d0;padding:6px 10px;text-align:right;{% if days is not none and days <= 7 %}color:#b71c1c;font-weight:bold;{% endif %}">{{ days if days is not none else '-' }}</td>
+{# in_use: 'yes' / 'no' / '-' . Older artifacts (jobs still on the previous
+   code) have no in_use key, so default to '-' rather than erroring. #}
+{% set used = row.in_use | default('-', true) | string | lower %}
+    <td style="border:1px solid #d0d0d0;padding:6px 10px;text-align:center;{% if used == 'no' %}color:#6b6b6b;{% endif %}">{{ 'Yes' if used in ['yes','true'] else ('No' if used in ['no','false'] else '-') }}</td>
     <td style="border:1px solid #d0d0d0;padding:6px 10px;">{{ row.status }}{% if row.error | default('', true) | length > 0 %}<br/><span style="color:#b71c1c;font-size:12px;">{{ row.error }}</span>{% endif %}</td>
   </tr>
 {% endfor %}
