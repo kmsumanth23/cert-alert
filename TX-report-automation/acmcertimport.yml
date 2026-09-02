@@ -54,6 +54,82 @@
   tags:
     - certs
 
+# ==================================================================
+# FETCH-ALL MODE (audit) — acm_fetch_all_certs: true
+#
+# Instead of checking only the domains configured for this client
+# (tools.yml `certificates`, or the TX DNS records), scan the WHOLE
+# account/region and report every IMPORTED certificate. Catches certs
+# that nobody is tracking — the class that silently expires.
+#
+# Pass it at workflow launch (or on the JT) exactly like acm_report_only:
+#     acm_fetch_all_certs: true
+#
+# ALWAYS READ-ONLY: these certs have no tools.yml entry, so there is no
+# k8s secret to pull. renewal_due is hardcoded false below, which skips
+# every write step (secret pull, chain verify, ACM import, cleanup) no
+# matter what acm_report_only says.
+#
+# AMAZON_ISSUED certs are excluded: they auto-renew, so listing them is
+# noise. Imported certs are the ones that expire without action.
+# ==================================================================
+- name: Get ALL ACM certificates in the region (fetch-all mode)
+  community.aws.acm_certificate_info:
+    region: "{{ aws_region }}"
+  register: all_acm_certs
+  delegate_to: localhost
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+    AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+    AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+  when: acm_fetch_all_certs | default(false) | bool
+  tags:
+    - certs
+
+- name: Show how many certificates were returned (fetch-all mode)
+  debug:
+    msg: >-
+      ACM returned {{ all_acm_certs.certificates | default([]) | length }} cert(s)
+      in {{ aws_region }};
+      {{ all_acm_certs.certificates | default([]) | selectattr('type', 'defined')
+         | selectattr('type', 'equalto', 'IMPORTED') | list | length }} are IMPORTED.
+  when: acm_fetch_all_certs | default(false) | bool
+  tags:
+    - certs
+
+# Keyed by domain, same shape as the normal path, so every downstream task
+# works unchanged. Sorted by expiry DESCENDING so that if two imported certs
+# share a domain, the last write wins = the one expiring SOONEST (the urgent one).
+- name: Build certificate information dictionary (all IMPORTED certs)
+  set_fact:
+    certs_info: "{{ certs_info | default({}) | combine({ c.domain_name: cert_details }) }}"
+  loop: >-
+    {{ all_acm_certs.certificates | default([])
+       | selectattr('type', 'defined') | selectattr('type', 'equalto', 'IMPORTED')
+       | selectattr('not_after', 'defined')
+       | sort(attribute='not_after', reverse=true) }}
+  loop_control:
+    loop_var: c
+    label: "{{ c.domain_name | default('?') }}"
+  vars:
+    cert_details:
+      cert_arn: "{{ c.certificate_arn }}"
+      not_after: "{{ c.not_after }}"
+      expire_ts: "{{ (c.not_after | to_datetime('%Y-%m-%dT%H:%M:%S%z')).timestamp() | int }}"
+      current_ts: "{{ ansible_date_time.epoch | int }}"
+      # Read-only by construction — see the block comment above.
+      renewal_due: false
+      secret_name: ''
+      secret_namespace: ''
+      in_use_by: "{{ c.in_use_by | default([]) }}"
+  when: acm_fetch_all_certs | default(false) | bool
+  tags:
+    - certs
+
+# ------------------------------------------------------------------
+# NORMAL MODE — check only this client's configured domains.
+# Skipped entirely in fetch-all mode.
+# ------------------------------------------------------------------
 - name: Get ACM Certificate Details
   community.aws.acm_certificate_info:
     domain_name: "{{ item.domain_name }}"
@@ -67,6 +143,7 @@
     AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
     AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
     AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+  when: not (acm_fetch_all_certs | default(false) | bool)
   tags:
     - certs
 
@@ -95,10 +172,12 @@
 - name: Build certificate information dictionary
   set_fact:
     certs_info: "{{ certs_info | default({}) | combine({ item.item.domain_name: cert_details }) }}"
-  loop: "{{ cert_facts.results }}"
+  loop: "{{ cert_facts.results | default([]) }}"
   loop_control:
     label: "{{ item.item.domain_name }}"
-  when: item.certificates | length > 0
+  when:
+    - not (acm_fetch_all_certs | default(false) | bool)
+    - item.certificates | length > 0
   vars:
     cert_details:
       cert_arn: "{{ item.certificates[0].certificate_arn }}"
@@ -379,7 +458,7 @@
     - certs_info[item].chain_verify_failed | default(false)
   tags: certs
 
-- name: Mark certificates expiring soon
+- name: Mark certificates as expiring soon or expired
   set_fact:
     certs_info: >-
       {{ certs_info | combine({
@@ -387,14 +466,18 @@
             'status': (
               item.value.status
               if (item.value.status is defined and item.value.status in ['renewed', 'import_failed', 'chain_verify_failed'])
-              else 'expiring_soon'
+              else (
+                'expired'
+                if ((item.value.expire_ts | int) - (ansible_date_time.epoch | int)) < 0
+                else 'expiring_soon'
+              )
             )
           })
       }) }}
   loop: "{{ certs_info | dict2items }}"
   loop_control:
     loop_var: item
-  when: ((item.value.expire_ts | int) - (ansible_date_time.epoch | int)) // 86400 <= client_cert_expiry_notice
+  when: ((item.value.expire_ts | int) - (ansible_date_time.epoch | int)) // 86400 <= (client_cert_expiry_notice | int)
   tags: certs
 
 # IMMEDIATE ALERT (kept, narrowed): only import failures email immediately.
@@ -475,9 +558,16 @@
 # set_stats artifacts land in the AWX database and job detail UI.
 # ------------------------------------------------------------------
 
+# In fetch-all mode this comparison is meaningless (and misleading): a
+# configured domain whose cert is AMAZON_ISSUED is in ACM, just not imported,
+# so it would be wrongly reported as not_found_in_acm.
 - name: Note configured domains with no matching certificate in ACM
   set_fact:
-    acm_missing_domains: "{{ certificates | default([]) | map(attribute='domain_name') | difference(certs_info | default({}) | list) }}"
+    acm_missing_domains: >-
+      {{ []
+         if (acm_fetch_all_certs | default(false) | bool)
+         else (certificates | default([]) | map(attribute='domain_name')
+               | difference(certs_info | default({}) | list)) }}
   tags: certs
 
 - name: Build sanitized report rows for consolidated digest
