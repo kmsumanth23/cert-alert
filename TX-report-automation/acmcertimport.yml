@@ -437,7 +437,13 @@
   loop: "{{ import_result.results }}"
   loop_control:
     loop_var: item
-  when: item.item is defined
+  when:
+    - item.item is defined
+    # Only stamp a status when an import actually RAN. A skipped item has no
+    # rc, and without this guard it fell through to default('expiring_soon'),
+    # labelling every cert 'expiring_soon' regardless of expiry — visible in
+    # fetch-all runs, where every import is skipped by design.
+    - item.rc is defined
   tags: certs
 
 # Certs that failed chain verification are skipped by the import task (gated on chain_verify_failed).
