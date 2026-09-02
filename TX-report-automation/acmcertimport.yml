@@ -70,16 +70,19 @@
   tags:
     - certs
 
-# Immediate-alert recipients, chosen by client group — same lookup the digest
-# uses. The workflow node passes acm_cert_group (e.g. 'tx'); when it is absent
-# (every non-TX client, and ad-hoc runs) this resolves to smtp_emails_certs and
-# behaviour is unchanged. This is why ONE cert playbook serves all groups:
-# a separate aws-cert-import-tx.yml is not needed.
+# Immediate-alert recipients, resolved in priority order:
+#   1. cert_report_subscriber from the group's own config file (TX: set in the
+#      DNS config and loaded by awsacmcertimportauto.yml)
+#   2. smtp_emails_certs_by_group[acm_cert_group]   (aws-client-vars-base.yml)
+#   3. smtp_emails_certs                            (default / all clients)
+# Non-TX clients hit (3) exactly as before, so ONE cert playbook serves every
+# group and a separate aws-cert-import-tx.yml is not needed.
 - name: Resolve immediate-alert recipients for this client group
   set_fact:
     cert_alert_recipients: >-
-      {{ (smtp_emails_certs_by_group | default({}))[acm_cert_group | default('')]
-         | default(smtp_emails_certs, true) }}
+      {{ tx_cert_report_subscriber
+         | default((smtp_emails_certs_by_group | default({}))[acm_cert_group | default('')]
+                   | default(smtp_emails_certs, true), true) }}
   tags:
     - certs
 
