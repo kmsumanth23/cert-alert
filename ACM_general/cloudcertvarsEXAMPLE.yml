@@ -1,0 +1,25 @@
+---
+# gcp-shared-services/playbooks/dns/cloud-cert-vars.yml
+#
+# A cert group's CONVENTIONS. Referenced by client-mapping.yml ->
+# <group>.cert_vars_file, loaded by the cert playbook as `cert_group_vars`.
+# Every key has a built-in default, so a group only overrides what differs.
+
+# --- certificate placement -------------------------------------------------
+namespace: "hclnow-certs"                 # k8s namespace holding the TLS secrets
+valid_suffix: "now.hclsoftware.cloud"     # stripped from the FQDN before deriving
+
+# --- derivation conventions (defaults shown) -------------------------------
+# secret_name = <host labels joined by '-'> + secret_name_suffix, lowercased
+#   cname-autotest.hxsa.now.hclsoftware.cloud.  ->  cname-autotest-hxsa-tls-cert
+secret_name_suffix: "-tls-cert"
+cert_record_types: ["A", "CNAME"]         # TXT are ACME challenge tokens, never certs
+
+# --- data-file shape (defaults shown) --------------------------------------
+records_key: "dns"                        # top-level key holding the record list
+record_name_field: "dns_full_name"        # field carrying the FQDN
+record_env_field: "env"                   # field carrying the client env
+
+# NOTE: this file may hold vault-encrypted values, so the playbook loads it
+# with include_vars (which decrypts) rather than lookup('file') | from_yaml.
+# The cert job template needs the matching Vault credential attached.

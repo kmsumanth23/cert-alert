@@ -1,0 +1,235 @@
+---
+# Basic OS setup commands that should be run on every server
+#
+# CHANGE (consolidated-digest redesign): added a fallback publish task after
+# the cert-import include. An env with no certificates configured now
+# publishes an EMPTY digest artifact instead of nothing, so the digest can
+# distinguish "no certs configured here" (healthy, empty report) from
+# "job died before reporting" (NO-report alarm row).
+- name: AWS Client VSI Bastian Setup
+  hosts: all
+  become: yes
+  gather_facts: yes
+  vars:
+    force_reboot: false
+    idx_obj: []
+  vars_files:
+    - aws-client-vars-base.yml
+
+  pre_tasks:
+    - name: Include the default and override variables
+      include_tasks: tasks/client-vars-include.yml
+      tags: common
+  tasks:
+    - name: Check if aws is installed
+      shell:
+        "which aws | cat"
+      args:
+        executable: /bin/bash
+      become: yes
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      register: awscmd
+      tags: certs
+
+    - name: DEBUG awscmd
+      debug:
+        msg: "{{ awscmd }}"
+      tags:
+        - debug
+        - never
+
+    - name: Install AWSCLI
+      shell: curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip";unzip -o awscliv2.zip;sudo ./aws/install;mkdir -p /root/.aws
+      become: yes
+      become_user: root
+      become_method: su
+      become_exe: sudo su -
+      when: not awscmd.stdout
+      tags: certs
+
+    - name: Configure aws for client env
+      file:
+        path: /home/{{ client_code }}/.aws
+        state: directory
+        mode: "0755"
+#      shell: mkdir -p /home/{{ client_code }}/.aws
+#      become: yes
+        owner: "{{ client_code }}"
+#      mode: "0755"
+#      become_method: su
+#      become_exe: sudo su -
+#      when: not awscmd.stdout
+      tags: certs
+
+    - name: Change ownership
+      file:
+        path: /home/{{ client_code }}
+        owner: "{{ client_code }}"
+        group: "{{ client_code }}"
+        recurse: yes
+      tags: certs
+
+    - name: Creating a file with content for aws profile
+      copy:
+        dest: "/root/.aws/credentials"
+        content: |
+          [{{ profile }}]
+          aws_access_key_id = {{ access_val }}
+          aws_secret_access_key = {{ sec_val }}
+          role_arn = {{ arn_auto_admin_val }}
+          source_profile = {{ profile }}
+        mode: '0600'
+      register: value
+      tags: certs
+#      when: not awscmd.stdout
+
+    - name: Set profile env var
+      set_fact:
+        "profile_{{ client_env_base }}": "srvc{{ client_env_base }}{{ client_code }}"
+      tags: certs
+
+    - name: Creating a file with content for aws profile respectively
+      copy:
+        dest: "/home/{{ client_code }}/.aws/credentials"
+        content: |
+          [{{ lookup( 'vars', 'profile_' + client_env_base ) }}]
+          aws_access_key_id = {{ lookup( 'vars', client_env_base +  '_access_val' ) }}
+          aws_secret_access_key = {{ lookup( 'vars', client_env_base +  '_sec_val' ) }}
+          role_arn = {{ lookup( 'vars', client_env_base +  '_role_arn' ) }}
+          source_profile = {{ lookup( 'vars', 'profile_' + client_env_base ) }}
+        mode: '0600'
+        owner: "{{ client_code }}"
+        tags: certs
+#      when: not awscmd.stdout
+
+    # ------------------------------------------------------------------
+    # GROUPED CLIENTS — source `certificates` from the group's own repo
+    # instead of tools.yml. Gated entirely on acm_cert_group, which the
+    # group workflow's nodes inject via extra_data. Ungrouped clients skip
+    # this block and behave exactly as before.
+    # See ACM_CERT_AUTOMATION_REFERENCE.md for the derivation rules.
+    # ------------------------------------------------------------------
+    - name: Load cert-group conventions
+      include_vars:
+        file: "{{ acm_group_vars_file }}"
+        name: cert_group_vars
+      when: acm_cert_group is defined
+      tags: certs
+
+    - name: Load cert-group data file
+      set_fact:
+        cert_group_config: "{{ lookup('file', acm_group_dns_file) | from_yaml | default({}, true) }}"
+      when: acm_cert_group is defined
+      tags: certs
+
+    - name: Extract group records and alert recipients
+      set_fact:
+        cert_group_records: "{{ cert_group_config[acm_group_records_key] | default([]) }}"
+        cert_group_subscriber: >-
+          {{ (raw_subscriber | join(','))
+             if (raw_subscriber is sequence and raw_subscriber is not string)
+             else raw_subscriber }}
+      vars:
+        acm_group_records_key: "{{ cert_group_vars.records_key | default('dns') }}"
+        raw_subscriber: "{{ cert_group_config.cert_report_subscriber | default('') }}"
+      when: acm_cert_group is defined
+      tags: certs
+
+    - name: Reset certificates list for group sourcing
+      set_fact:
+        certificates: []
+      when: acm_cert_group is defined
+      tags: certs
+
+    - name: Build certificates list from group records
+      set_fact:
+        certificates: "{{ certificates + [cert_entry] }}"
+      loop: "{{ cert_group_records | default([]) }}"
+      loop_control:
+        loop_var: rec
+        label: "{{ rec[acm_group_name_field] | default('?') }}"
+      when:
+        - acm_cert_group is defined
+        - rec[acm_group_name_field] is defined
+        - (rec.dns_type | default('A') | upper) in acm_group_record_types
+        - not rec_fqdn.startswith('_acme-challenge.')
+        - not rec_host.startswith('*')
+        - rec_host_labels | length > 1
+        - rec_client_label == (acm_report_client | default(client_code))
+        # The client is derivable from the domain, the env is not. A record
+        # with no env is SKIPPED, never assumed — a wrong guess would pull a
+        # secret from the wrong cluster.
+        - (rec[acm_group_env_field] | default('')) == (acm_report_env | default(client_env))
+      vars:
+        acm_group_name_field: "{{ cert_group_vars.record_name_field | default('dns_full_name') }}"
+        acm_group_env_field: "{{ cert_group_vars.record_env_field | default('env') }}"
+        acm_group_record_types: "{{ cert_group_vars.cert_record_types | default(['A', 'CNAME']) }}"
+        acm_group_secret_suffix: "{{ cert_group_vars.secret_name_suffix | default('-tls-cert') }}"
+        rec_fqdn: "{{ rec[acm_group_name_field] | regex_replace('\\.$', '') }}"
+        rec_suffix: "{{ cert_group_vars.valid_suffix | default('now.hclsoftware.cloud') }}"
+        rec_host: "{{ rec_fqdn | regex_replace('\\.' ~ (rec_suffix | regex_escape) ~ '$', '') }}"
+        rec_host_labels: "{{ rec_host.split('.') }}"
+        rec_client_label: "{{ rec_host_labels[-1] }}"
+        cert_entry:
+          domain_name: "{{ rec_fqdn }}"
+          # Full host part, hyphenated, plus the group's suffix. Lowercased
+          # because k8s object names must be RFC-1123 lowercase.
+          secret_name: "{{ ((rec_host_labels | join('-')) ~ acm_group_secret_suffix) | lower }}"
+          secret_namespace: "{{ cert_group_vars.namespace | default('hclnow-certs') }}"
+      tags: certs
+
+    - name: Show certificates derived for this client env
+      debug:
+        msg: >-
+          Group '{{ acm_cert_group }}' source file: {{ acm_group_dns_file }}
+          | {{ cert_group_records | default([]) | length }} record(s) read,
+          {{ certificates | length }} certificate(s) derived for
+          {{ acm_report_client | default(client_code) }}/{{ acm_report_env | default(client_env) }}
+          -> {{ certificates | map(attribute='secret_name') | list }}
+          | records missing an env field (skipped):
+          {{ cert_group_records | default([])
+             | rejectattr(cert_group_vars.record_env_field | default('env'), 'defined')
+             | map(attribute=cert_group_vars.record_name_field | default('dns_full_name'))
+             | list }}
+          | alert recipients: {{ cert_group_subscriber | default('(falling back to smtp vars)', true) }}
+      when: acm_cert_group is defined
+      tags: certs
+
+    - name: include tasks to import cert to acm
+      include_tasks: tasks/aws-cert-import.yml
+      when: >-
+        (certificates | length > 0)
+        or (acm_fetch_all_certs | default(false) | bool)
+      tags: certs
+
+#      when: not kubectlcmd.stdout
+
+    # No certificates configured for this client env: publish an EMPTY
+    # report so the consolidated digest counts this env as "reported,
+    # nothing to check" instead of raising a NO-report alarm row.
+    # Key construction mirrors the publish task in tasks/aws-cert-import.yml:
+    # acm_report_client/acm_report_env (workflow node extra_data) win,
+    # inventory vars are the fallback for ad-hoc runs.
+    - name: Publish empty digest artifact when no certificates configured
+      set_stats:
+        data: "{{ { acm_report_key: acm_report_payload } }}"
+        per_host: false
+        aggregate: true
+      vars:
+        acm_key_client: "{{ acm_report_client | default(client_code) }}"
+        acm_key_env: "{{ acm_report_env | default(client_env) }}"
+        acm_report_key: "acm_report_{{ acm_key_client | regex_replace('[^A-Za-z0-9]', '_') }}_{{ acm_key_env | regex_replace('[^A-Za-z0-9]', '_') }}"
+        acm_report_payload:
+          client: "{{ acm_key_client }}"
+          env: "{{ acm_key_env }}"
+          collected_at: "{{ ansible_date_time.iso8601 }}"
+          renewal_threshold_days: "{{ client_cert_expiry_notice | default(0) }}"
+          certs: []
+      when:
+        - certificates | default([]) | length == 0
+        # In fetch-all mode the include above already ran and published a real
+        # report; publishing an empty one here would overwrite it.
+        - not (acm_fetch_all_certs | default(false) | bool)
+      tags: certs

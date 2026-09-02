@@ -1,0 +1,38 @@
+---
+# gcp-shared-services/playbooks/awx/kube/common/vars/client-mapping.yml
+#
+# Central client mapping — single source of truth for client group config.
+# Adding a cert group is a DATA change here; no playbook edit is required.
+#
+# Required per group:
+#   clients        list of client codes belonging to the group
+#   git_project    repo directory holding the group's cert data. MUST be a
+#                  submodule of aws-v9-automation (the cert job's checkout).
+#
+# Optional per group (defaults shown):
+#   cert_vars_file  playbooks/dns/cloud-cert-vars.yml   # relative to gcp-shared-services
+#   dns_file        hclsoftware-cloud-dns-{{ env }}.yml # {{ env }} <- acm_group_dns_env
+#   job_template    Import Certificate to ACM in AWS
+#   workflow_name   renew certs - aws - <group> clients
+#   schedule        Runs daily certs
+#
+# Build a group's workflow with:  acm_cert_group: <group>
+
+client_parent:
+  tx:
+    git_project: hclnow-client-hxtx
+    clients:
+      - hxtx
+      - mosa
+      - txle
+      - hxsa          # testing only — remove before production rollout
+
+  # Example of a second group overriding every optional key:
+  # acme:
+  #   git_project: hclnow-client-acme
+  #   clients: [acme]
+  #   cert_vars_file: playbooks/dns/acme-cert-vars.yml
+  #   dns_file: "certs-{{ env }}.yml"
+  #   job_template: "Import Certificate to ACM in AWS - ACME"
+  #   workflow_name: "renew certs - aws - acme"
+  #   schedule: "ACME daily certs"
