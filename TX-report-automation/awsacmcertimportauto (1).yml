@@ -134,12 +134,6 @@
     #   domain_name      = FQDN without the trailing dot
     #   secret_namespace = cloud-cert-vars.yml -> namespace
     # ------------------------------------------------------------------
-    # NOTE: the default is inlined INSIDE lookup() on purpose. Putting it in a
-    # task-level `vars:` entry of the same name (acm_tx_vars_file defaulting
-    # from acm_tx_vars_file) is self-referential and raises
-    # "recursive loop detected in template string" whenever the override is not
-    # supplied from outside — which is always for this one, since the generator
-    # does not pass it.
     - name: Load TX shared cert vars
       set_fact:
         tx_cert_vars: "{{ lookup('file', acm_tx_vars_file | default(base_src ~ '/gcp-shared-services/playbooks/dns/cloud-cert-vars.yml', true)) | from_yaml }}"
@@ -157,6 +151,7 @@
              | default(base_src ~ '/' ~ (acm_tx_git_project | default('hclnow-client-hxtx'))
                        ~ '/hclsoftware-cloud-dns-' ~ (acm_tx_dns_env | default('prod')) ~ '.yml', true) }}
       when: (acm_certs_source | default('')) == 'tx'
+      tags: certs
 
     - name: Extract TX DNS records and alert recipients
       set_fact:
@@ -218,9 +213,7 @@
     - name: Show TX certificates derived for this client env
       debug:
         msg: >-
-          TX source file: {{ acm_tx_dns_file | default('(generator default)') }}
-          | top-level keys: {{ (tx_dns_config | default({})).keys() | list }}
-          | {{ tx_dns_records | default([]) | length }} DNS record(s) read,
+          TX source: {{ tx_dns_records | default([]) | length }} DNS record(s) read,
           {{ certificates | length }} certificate(s) derived for
           {{ acm_report_client | default(client_code) }}/{{ acm_report_env | default(client_env) }}
           -> {{ certificates | map(attribute='secret_name') | list }}
@@ -230,9 +223,15 @@
       when: (acm_certs_source | default('')) == 'tx'
       tags: certs
 
+    # FETCH-ALL MODE (acm_fetch_all_certs: true) scans the whole account and
+    # ignores `certificates`, so it must run even when this client has none
+    # configured — otherwise the audit would silently skip exactly the envs
+    # most likely to hold untracked certs.
     - name: include tasks to import cert to acm
       include_tasks: tasks/aws-cert-import.yml
-      when: certificates | length > 0
+      when: >-
+        (certificates | length > 0)
+        or (acm_fetch_all_certs | default(false) | bool)
       tags: certs
 
 #      when: not kubectlcmd.stdout
@@ -258,5 +257,9 @@
           collected_at: "{{ ansible_date_time.iso8601 }}"
           renewal_threshold_days: "{{ client_cert_expiry_notice | default(0) }}"
           certs: []
-      when: certificates | default([]) | length == 0
+      when:
+        - certificates | default([]) | length == 0
+        # In fetch-all mode the include above already ran and published a real
+        # report; publishing an empty one here would overwrite it.
+        - not (acm_fetch_all_certs | default(false) | bool)
       tags: certs
