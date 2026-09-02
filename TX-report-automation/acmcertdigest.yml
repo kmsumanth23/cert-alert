@@ -31,11 +31,9 @@
     # smtp_server / smtp_port / smtp_auth_* / smtp_default_sender /
     # smtp_emails_certs / cloudops_group_emails.
     - "aws-client-vars-base.yml"
-  vars:
-    # Requirement 1: report every cert expiring within the next 15 days.
-    # (Play var — an extra var of the same name on the JT overrides it,
-    # which is how the PoC forced emails with a 45-day window.)
-    digest_expiry_days: 15
+  # digest_expiry_days now comes from aws-client-vars-base.yml (vars_files
+  # above). Kept out of the play so the window is configurable without a code
+  # change; an extra var of the same name still overrides it for one run.
   tasks:
 
     - name: Assert expected_reports manifest was provided
