@@ -211,10 +211,10 @@
       {%-     if loop.last -%}
       {%-       set next_ident = 'node-digest-report' -%}
       {%-     else -%}
-      {%-       set next_ident = 'node-' ~ e.client ~ '-' ~ env_list[loop.index].env -%}
+      {%-       set next_ident = 'renew-cert-' ~ e.client ~ '-' ~ env_list[loop.index].env -%}
       {%-     endif -%}
       {%-     set node = {
-                'identifier': 'node-' ~ e.client ~ '-' ~ e.env,
+                'identifier': 'renew-cert-' ~ e.client ~ '-' ~ e.env,
                 'inventory': 'inventory_client_' ~ e.client ~ '_' ~ e.env,
                 'unified_job_template': {'name': acm_jt_name, 'type': 'job_template'},
                 'extra_data': {
@@ -227,16 +227,23 @@
                 'related': {'always_nodes': [next_ident]}
               } -%}
       {#-     TX MODE: tell the job to source `certificates` from the TX repo
-              instead of tools.yml, and (phase 1) keep the run read-only. -#}
+              instead of tools.yml. NOTE: acm_report_only is deliberately NOT
+              pinned here — node extra_data would override anything passed at
+              workflow-launch time, so a read-only run could not be requested
+              without regenerating. It is only baked in when the operator
+              passes it explicitly at generation time. -#}
       {%-     if acm_tx_mode | default(false) | bool -%}
       {%-       set node = node | combine({'extra_data':
                   node.extra_data | combine({
                     'acm_certs_source': 'tx',
                     'acm_tx_dns_file': acm_tx_dns_file_resolved,
-                    'acm_report_only': acm_report_only | default(true),
                     'acm_cert_group': acm_tx_parent | default('tx')
                   })
                 }) -%}
+      {%-       if acm_report_only is defined -%}
+      {%-         set node = node | combine({'extra_data':
+                    node.extra_data | combine({'acm_report_only': acm_report_only}) }) -%}
+      {%-       endif -%}
       {%-     endif -%}
       {#-     PRODUCTION: nodes run the JT's default SCM branch. Pass
               acm_scm_branch_override as an extra var to pin a test branch
@@ -249,11 +256,13 @@
       {%- endfor -%}
       {{ nodes }}
   vars:
-    # TX mode swaps in the TX-specific job template so the TX team can be
-    # granted Execute on it without touching the DevOps-owned JT.
+    # One general job template serves every group — the TX/non-TX difference is
+    # carried in node extra_data, not in the playbook. Pass acm_tx_job_template
+    # if/when a dedicated TX template is created (needed only when the TX team
+    # gets its own credentials or Execute access).
     acm_jt_name: >-
       {{ (acm_tx_mode | default(false) | bool)
-         | ternary(acm_tx_job_template | default('Import Certificate to ACM in AWS - TX'),
+         | ternary(acm_tx_job_template | default('Import Certificate to ACM in AWS'),
                    'Import Certificate to ACM in AWS') }}
     # Which combined DNS file the TX jobs read. The repo directory comes from
     # the mapping's git_project. Switch files with acm_tx_dns_env (test|prod),
@@ -274,6 +283,12 @@
   set_fact:
     aws_cert_workflow_nodes: "{{ aws_cert_workflow_nodes + [digest_node] }}"
   vars:
+    # NOTE: ONE vars: block only. A second vars: key on the same task silently
+    # replaces this one (YAML duplicate key), leaving digest_node undefined.
+    acm_tx_dns_file_resolved: >-
+      {{ acm_tx_dns_file
+         | default((base_src | default('/runner/project')) ~ '/' ~ (acm_tx_git_project | default(''))
+                   ~ '/hclsoftware-cloud-dns-' ~ (acm_tx_dns_env | default('prod')) ~ '.yml', true) }}
     digest_node:
       identifier: node-digest-report
       all_parents_must_converge: true
@@ -297,11 +312,6 @@
            | combine({'acm_cert_group': (acm_tx_parent | default('tx')),
                       'acm_tx_dns_file': acm_tx_dns_file_resolved}
                      if (acm_tx_mode | default(false) | bool) else {}) }}
-  vars:
-    acm_tx_dns_file_resolved: >-
-      {{ acm_tx_dns_file
-         | default((base_src | default('/runner/project')) ~ '/' ~ (acm_tx_git_project | default(''))
-                   ~ '/hclsoftware-cloud-dns-' ~ (acm_tx_dns_env | default('prod')) ~ '.yml', true) }}
   when: aws_cert_envs | length > 0
 
 - name: Print consolidated workflow nodes
@@ -321,6 +331,7 @@
     awx_workflow_certs_aws:
       # TX mode gets its own default name, so it can never overwrite the main
       # workflow even if acm_workflow_name_override is forgotten.
+      # - name: "{{ acm_workflow_name_override | default('TEST Renew certs AWS all clients') }}" #working all clients setup
       - name: >-
           {{ acm_workflow_name_override
              | default((acm_tx_mode | default(false) | bool)
@@ -329,6 +340,11 @@
         organization: "{{ default_support_org }}"
         ask_inventory_on_launch: false
         ask_scm_branch_on_launch: false
+        # Lets an operator pass extra vars when LAUNCHING the workflow — this
+        # is how a one-off read-only run is requested:
+        #   acm_report_only: true
+        # Workflow-level extra vars flow down to every node's job.
+        ask_variables_on_launch: true
         state: present
         description: >-
           Consolidated AWS cert renewal{{
@@ -356,6 +372,7 @@
 # Inert (skipped) on any run without acm_test_workflow_delete.
 - name: Delete target consolidated workflow before rebuild (opt-in)
   awx.awx.workflow_job_template:
+    # name: "{{ acm_workflow_name_override | default('TEST Renew certs AWS all clients') }}" #working all clients setup
     name: >-
       {{ acm_workflow_name_override
          | default((acm_tx_mode | default(false) | bool)
@@ -381,13 +398,13 @@
     - awx_workflow_certs_aws | length > 0
 
 # Step 6 — Schedule it
-- name: Schedule consolidated AWS certs workflow
-  include_tasks:
-    file: awx-create-schedule.yml
-  loop: "{{ awx_workflow_certs_aws | list }}"
-  loop_control:
-    loop_var: job
-    label: "{{ job.name }}"
-  when:
-    - awx_workflow_certs_aws is defined
-    - awx_workflow_certs_aws | length > 0
+# - name: Schedule consolidated AWS certs workflow
+#   include_tasks:
+#     file: awx-create-schedule.yml
+#   loop: "{{ awx_workflow_certs_aws | list }}"
+#   loop_control:
+#     loop_var: job
+#     label: "{{ job.name }}"
+#   when:
+#     - awx_workflow_certs_aws is defined
+#     - awx_workflow_certs_aws | length > 0
