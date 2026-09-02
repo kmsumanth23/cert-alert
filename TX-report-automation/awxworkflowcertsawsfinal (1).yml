@@ -290,10 +290,18 @@
       unified_job_template:
         name: 'ACM Certs Digest Report'
         type: 'job_template'
+      # In TX mode the digest also needs the DNS config path, because the TX
+      # alert recipients (cert_report_subscriber) live in that file.
       extra_data: >-
         {{ {'expected_reports': aws_cert_envs}
-           | combine({'acm_cert_group': (acm_tx_parent | default('tx'))}
+           | combine({'acm_cert_group': (acm_tx_parent | default('tx')),
+                      'acm_tx_dns_file': acm_tx_dns_file_resolved}
                      if (acm_tx_mode | default(false) | bool) else {}) }}
+  vars:
+    acm_tx_dns_file_resolved: >-
+      {{ acm_tx_dns_file
+         | default((base_src | default('/runner/project')) ~ '/' ~ (acm_tx_git_project | default(''))
+                   ~ '/hclsoftware-cloud-dns-' ~ (acm_tx_dns_env | default('prod')) ~ '.yml', true) }}
   when: aws_cert_envs | length > 0
 
 - name: Print consolidated workflow nodes
