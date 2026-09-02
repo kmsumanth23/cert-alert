@@ -109,11 +109,28 @@
     # acm_cert_group (e.g. 'tx'); the main workflow passes nothing, so the
     # default smtp_emails_certs is used and its behaviour is unchanged.
     # Group lists live in aws-client-vars-base.yml as smtp_emails_certs_by_group.
+    # A group may carry its own recipient list in its config file (TX:
+    # cert_report_subscriber inside the DNS config, path passed by the
+    # generator as acm_tx_dns_file). Read it when present.
+    - name: Load group config for recipients
+      set_fact:
+        group_cfg: "{{ lookup('file', acm_tx_dns_file) | from_yaml | default({}, true) }}"
+      when: acm_tx_dns_file is defined
+      failed_when: false
+
     - name: Resolve digest recipients for this client group
       set_fact:
         digest_recipients: >-
-          {{ (smtp_emails_certs_by_group | default({}))[acm_cert_group | default('')]
-             | default(smtp_emails_certs, true) }}
+          {{ group_subscriber
+             | default((smtp_emails_certs_by_group | default({}))[acm_cert_group | default('')]
+                       | default(smtp_emails_certs, true), true) }}
+      vars:
+        raw_subscriber: "{{ (group_cfg | default({})).cert_report_subscriber | default('') }}"
+        # Accept a YAML list or a comma-separated string.
+        group_subscriber: >-
+          {{ (raw_subscriber | join(','))
+             if (raw_subscriber is sequence and raw_subscriber is not string)
+             else raw_subscriber }}
 
     - name: Show which recipient list is in use
       debug:
