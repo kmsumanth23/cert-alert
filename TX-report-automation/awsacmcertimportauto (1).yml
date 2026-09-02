@@ -140,6 +140,15 @@
       when: (acm_certs_source | default('')) == 'tx'
       tags: certs
 
+    - name: Load TX shared cert vars
+      include_vars:
+        file: >-
+          {{ acm_tx_vars_file
+             | default(base_src ~ '/gcp-shared-services/playbooks/dns/cloud-cert-vars.yml', true) }}
+        name: tx_cert_vars          # namespaced — no key collisions
+      when: (acm_certs_source | default('')) == 'tx'
+      tags: certs
+
     # Load the whole DNS config once: it carries both the dns records and the
     # TX alert recipients (cert_report_subscriber).
     - name: Load TX DNS config file
