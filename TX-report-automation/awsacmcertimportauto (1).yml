@@ -121,14 +121,18 @@
     #                      -> dns: [] records, combined across TX clients;
     #                      the generator resolves and passes this path
     #
-    # Derivation per DNS record (validated against the test + prod files):
-    #   dns_full_name "qa-custa.hxtx.now.hclsoftware.cloud."
-    #     -> strip trailing dot        "qa-custa.hxtx.now.hclsoftware.cloud"
-    #     -> strip .valid_suffix       "qa-custa.hxtx"
-    #     -> drop last label (client)  "qa-custa"
-    #     -> dots to hyphens + '-tls'  "qa-custa-tls"
+    # Derivation per DNS record:
+    #   dns_full_name "cname-autotest.hxsa.now.hclsoftware.cloud."
+    #     -> strip trailing dot             "cname-autotest.hxsa.now.hclsoftware.cloud"
+    #     -> strip .valid_suffix            "cname-autotest.hxsa"
+    #     -> dots to hyphens (KEEP all labels, client code included)
+    #                                       "cname-autotest-hxsa"
+    #     -> append '-tls-cert'             "cname-autotest-hxsa-tls-cert"
+    #   More examples:
+    #     qa-custa.hxtx...      -> qa-custa-hxtx-tls-cert
+    #     dev.swep.mosa...      -> dev-swep-mosa-tls-cert
     #   domain_name      = FQDN without the trailing dot
-    #   secret_namespace = tx-cloud-cert-vars.yml -> namespace
+    #   secret_namespace = cloud-cert-vars.yml -> namespace
     # ------------------------------------------------------------------
     - name: Load TX shared cert vars
       set_fact:
@@ -140,14 +144,29 @@
       when: (acm_certs_source | default('')) == 'tx'
       tags: certs
 
-    - name: Load TX DNS records
+    # Load the whole DNS config once: it carries both the dns records and the
+    # TX alert recipients (cert_report_subscriber).
+    - name: Load TX DNS config file
       set_fact:
-        tx_dns_records: "{{ (lookup('file', acm_tx_dns_file) | from_yaml).dns | default([]) }}"
+        tx_dns_config: "{{ lookup('file', acm_tx_dns_file) | from_yaml | default({}, true) }}"
       vars:
         acm_tx_dns_file: >-
           {{ acm_tx_dns_file
              | default(base_src ~ '/' ~ (acm_tx_git_project | default('hclnow-client-hxtx'))
                        ~ '/hclsoftware-cloud-dns-' ~ (acm_tx_dns_env | default('prod')) ~ '.yml', true) }}
+      when: (acm_certs_source | default('')) == 'tx'
+
+    - name: Extract TX DNS records and alert recipients
+      set_fact:
+        tx_dns_records: "{{ tx_dns_config.dns | default([]) }}"
+        # cert_report_subscriber may be a YAML list or a comma-separated
+        # string; normalise to the comma-separated form the mail module wants.
+        tx_cert_report_subscriber: >-
+          {{ (tx_dns_config.cert_report_subscriber | join(','))
+             if (tx_dns_config.cert_report_subscriber is defined
+                 and tx_dns_config.cert_report_subscriber is sequence
+                 and tx_dns_config.cert_report_subscriber is not string)
+             else (tx_dns_config.cert_report_subscriber | default('')) }}
       when: (acm_certs_source | default('')) == 'tx'
       tags: certs
 
@@ -174,6 +193,12 @@
         - not tx_host.startswith('*')
         - tx_host_labels | length > 1
         - tx_client_label == (acm_report_client | default(client_code))
+        # ENV FILTER: the record's own env must match the env this job is
+        # running for. The client is derivable from the domain, the env is
+        # not — this field is what makes multi-env TX clients safe, so a
+        # record with no env is SKIPPED rather than assumed to be ours
+        # (a wrong guess would pull a secret from the wrong cluster).
+        - (rec.env | default('')) == (acm_report_env | default(client_env))
       vars:
         tx_fqdn: "{{ rec.dns_full_name | regex_replace('\\.$', '') }}"
         tx_suffix: "{{ tx_cert_vars.valid_suffix | default('now.hclsoftware.cloud') }}"
@@ -182,7 +207,9 @@
         tx_client_label: "{{ tx_host_labels[-1] }}"
         cert_entry:
           domain_name: "{{ tx_fqdn }}"
-          secret_name: "{{ (tx_host_labels[:-1] | join('-')) ~ '-tls' }}"
+          # Full host part (client label included), hyphenated, '-tls-cert'.
+          # Lowercased because k8s object names must be RFC-1123 lowercase.
+          secret_name: "{{ ((tx_host_labels | join('-')) ~ '-tls-cert') | lower }}"
           secret_namespace: "{{ tx_cert_vars.namespace | default('hclnow-certs') }}"
       tags: certs
 
@@ -193,6 +220,9 @@
           {{ certificates | length }} certificate(s) derived for
           {{ acm_report_client | default(client_code) }}/{{ acm_report_env | default(client_env) }}
           -> {{ certificates | map(attribute='secret_name') | list }}
+          | records missing an 'env' field (skipped):
+          {{ tx_dns_records | default([]) | rejectattr('env', 'defined') | map(attribute='dns_full_name') | list }}
+          | alert recipients: {{ tx_cert_report_subscriber | default('(falling back to smtp vars)', true) }}
       when: (acm_certs_source | default('')) == 'tx'
       tags: certs
 
