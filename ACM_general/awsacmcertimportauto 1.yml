@@ -111,10 +111,37 @@
     # this block and behave exactly as before.
     # See ACM_CERT_AUTOMATION_REFERENCE.md for the derivation rules.
     # ------------------------------------------------------------------
+    # cloud-cert-vars.yml belongs to the DNS job. It contains entries that
+    # reference variables only THAT job defines, and include_vars templates its
+    # values LAZILY — reading any single key forces the whole dict to render,
+    # so the cert job dies on the first foreign reference:
+    #   dns_file_path: "{{ base_src }}/{{ dns_config_project }}/...{{ awx_env }}.yml"
+    #                                    ^^^^^^^^^^^^^^^^^^        ^^^^^^^
+    # The two shims below are the ONLY foreign references in that file today
+    # (verified: base_src, client_code, client_env are already in scope here).
+    # They are the real values, not placeholders, so that file's own
+    # dns_file_path renders to the same path the generator built.
+    #
+    # If someone adds a third foreign reference to cloud-cert-vars.yml, THIS
+    # task is where it fails. Add the shim here — do not sprinkle vars: onto
+    # the consumers below; they read the rendered snapshot, never the raw dict.
     - name: Load cert-group conventions
       include_vars:
         file: "{{ acm_group_vars_file }}"
-        name: cert_group_vars
+        name: cert_group_vars_raw
+      when: acm_cert_group is defined
+      tags: certs
+
+    # Renders the raw dict ONCE, with the shims in scope, into a fact of plain
+    # strings. Every task below reads cert_group_vars and never re-templates.
+    # The two names must differ — set_fact'ing a var onto itself is the
+    # "recursive loop detected in template string" trap.
+    - name: Snapshot cert-group conventions
+      set_fact:
+        cert_group_vars: "{{ cert_group_vars_raw }}"
+      vars:
+        dns_config_project: "{{ acm_group_git_project | default('', true) }}"
+        awx_env: "{{ acm_group_dns_env | default('prod', true) }}"
       when: acm_cert_group is defined
       tags: certs
 
