@@ -107,6 +107,10 @@
          | default(acm_base ~ '/gcp-shared-services/'
                    ~ (acm_group_cfg.cert_vars_file
                       | default('playbooks/dns/cloud-cert-vars.yml', true)), true) }}
+    # Passed to the job purely so the cert-vars file's own {{ }} entries can
+    # render there. See "Snapshot cert-group conventions" in the parent playbook.
+    acm_group_git_project_resolved: "{{ (acm_group_cfg | default({})).git_project | default('', true) }}"
+    acm_group_dns_env_resolved: "{{ acm_dns_env }}"
   vars:
     acm_base: "{{ base_src | default('/runner/project') }}"
     acm_dns_env: "{{ acm_group_dns_env | default('prod') }}"
@@ -116,6 +120,8 @@
   set_fact:
     acm_group_dns_file_resolved: ''
     acm_group_vars_file_resolved: ''
+    acm_group_git_project_resolved: ''
+    acm_group_dns_env_resolved: ''
   when: not (acm_group_mode | bool)
 
 - name: Print resolved cert group configuration
@@ -265,7 +271,9 @@
                   node.extra_data | combine({
                     'acm_cert_group': acm_cert_group,
                     'acm_group_dns_file': acm_group_dns_file_resolved,
-                    'acm_group_vars_file': acm_group_vars_file_resolved
+                    'acm_group_vars_file': acm_group_vars_file_resolved,
+                    'acm_group_git_project': acm_group_git_project_resolved,
+                    'acm_group_dns_env': acm_group_dns_env_resolved
                   })
                 }) -%}
       {%-       if acm_report_only is defined -%}
