@@ -375,7 +375,131 @@ project. Revert to `master` before production.
 
 ---
 
-## 10. Troubleshooting
+## 10. Onboarding a new client group
+
+No group name exists anywhere in the code. Onboarding is a **data** change in
+two files plus AWX object setup. This section is the checklist, and the reasons
+behind each item — most were learned the hard way during the TX rollout.
+
+### 10.1 Prerequisites
+
+| # | Requirement | Why |
+|---|---|---|
+| 1 | A git repo holding the group's DNS/cert records, added as a **submodule of `aws-v9-automation`** | The cert job reads it from its own checkout. A submodule of `gcp-shared-services` is not visible to the cert job |
+| 2 | Every record carries the **client label inside the FQDN** and an **explicit env field** | Client is derived from the domain; env is **not derivable**. A record with no env field is skipped, never guessed — a wrong guess pulls a TLS secret from the wrong cluster |
+| 3 | A cert-vars file in `gcp-shared-services` declaring at minimum `namespace` and `valid_suffix` | The built-in fallbacks are HCL-specific (§10.4) |
+| 4 | That cert-vars file must reference **no variables outside the cert job's scope**, or a shim must be added | `include_vars` renders the whole file (§10.4) |
+| 5 | AWX inventory `inventory_client_<client>_<env>` exists for every client-env in the group | A missing inventory aborts the build **before** the link pass, leaving a linkless workflow |
+| 6 | The Import JT carries a **Vault credential** if the cert-vars file has vaulted values | `include_vars` decrypts; `lookup('file') \| from_yaml` cannot |
+| 7 | One client-env = one Kubernetes cluster | Secrets are pulled per client-env; two clusters behind one env would silently pull from whichever the bastion reaches |
+| 8 | `cert_report_subscriber` in the group's data file (optional) | Group-scoped digest recipients; without it the group falls back to `smtp_emails_certs` and mails the shared list |
+
+### 10.2 Steps
+
+1. **Add the submodule** to `aws-v9-automation`, then confirm the AWX project
+   syncs submodules. Track-submodules is enabled on this tower, so `.gitmodules`
+   → `branch` decides the checkout, not the pinned commit.
+2. **Add the group** to `playbooks/awx/kube/common/vars/client-mapping.yml`:
+
+   ```yaml
+   client_parent:
+     <group>:
+       git_project: <submodule dir>
+       clients: [<client>, ...]
+       # optional overrides:
+       # cert_vars_file / dns_file / job_template / workflow_name / schedule
+   ```
+3. **Point `cert_vars_file`** at the group's conventions file, or leave it
+   unset to use `playbooks/dns/cloud-cert-vars.yml`.
+4. **Verify the cert-vars file is safe to include** — this is the step that
+   bit us:
+
+   ```bash
+   grep -o '{{[^}]*}}' <cert_vars_file> | sort -u
+   ```
+
+   Only `base_src`, `client_code`, `client_env` are in the cert job's scope.
+   Anything else needs a shim in *Snapshot cert-group conventions* (§10.4).
+5. **Generate scoped to one env first**, against a test branch:
+
+   ```yaml
+   acm_cert_group: "<group>"
+   acm_cert_env_whitelist: ["<client>/<env>"]
+   acm_test_ignore_refresh_flag: true
+   acm_group_dns_env: "test"
+   acm_workflow_name_override: "TEST renew certs - aws - <group>"
+   acm_test_workflow_delete: true
+   acm_scm_branch_override: "<test branch>"
+   ```
+6. **Run read-only** (`acm_report_only: true` at launch) and read the
+   **"Show certificates derived for this client env"** line: source file,
+   records read, certificates derived, records skipped for a missing env,
+   resolved recipients.
+7. **Verify the derived secret names** against
+   `kubectl get secrets -n <namespace>`. This is the gate for enabling
+   renewal — a wrong `valid_suffix` or `secret_name_suffix` shows up here.
+8. **Widen** to the whole group, drop `acm_report_only`, then regenerate
+   without the test overrides so the schedule attaches.
+
+### 10.3 Is there any hardcoding left?
+
+No group, client, or repo name appears in any of the four code files — the only
+occurrences are in comments and worked examples. What *is* baked in:
+
+| Baked in | Overridable? | Note |
+|---|---|---|
+| `now.hclsoftware.cloud`, `hclnow-certs` | Yes — `valid_suffix`, `namespace` | **Fails silently**, see §10.4 |
+| `dns`, `dns_full_name`, `env`, `[A, CNAME]`, `-tls-cert` | Yes — `records_key`, `record_name_field`, `record_env_field`, `cert_record_types`, `secret_name_suffix` | Same silent-failure class |
+| `Import Certificate to ACM in AWS`, `Runs daily certs`, `renew certs - aws - <group> clients` | Yes — `job_template`, `schedule`, `workflow_name` in the mapping | Fails loudly |
+| Record shape: a top-level key holding a **flat list** of records | **No** | A nested or per-client-keyed file needs a code change |
+| `inventory_client_<client>_<env>` naming | **No** | Pre-existing platform convention |
+| `hclnow-config-client-environments` layout, `srvc<env><client>` profiles | **No** | Pre-existing, outside this work |
+
+So: a new external client following the same structure is a data change. A
+client with a *differently shaped* records file needs the derivation extended.
+
+### 10.4 Discovered gotchas
+
+**`include_vars` renders the whole file.** It templates values lazily, so
+reading one key forces every value in the file to render. `cloud-cert-vars.yml`
+belongs to the DNS job and contains
+`dns_file_path: "{{ base_src }}/{{ dns_config_project }}/...{{ awx_env }}.yml"`,
+which killed the cert job with `dns_config_project is undefined`. Fixed by
+rendering the dict **once**, in *Snapshot cert-group conventions*, with
+`dns_config_project` and `awx_env` supplied as task-level `vars:` from
+`acm_group_git_project` / `acm_group_dns_env` (both injected as node
+`extra_data`). A third foreign reference fails in that same task — add the shim
+there, not on the consumers.
+
+**Vault forced that switch.** The task originally used
+`lookup('file') | from_yaml`, which left those strings inert and never hit the
+problem — but it also cannot decrypt inline `!vault` values, which is why the
+file had to move to `include_vars` in the first place. Do not "fix" the render
+error by reverting.
+
+**The convention defaults fail silently, not loudly.** An external client whose
+domain is not `now.hclsoftware.cloud` and who does not set `valid_suffix` gets
+*derived certificates with wrong secret names* — a green run, an empty or wrong
+report, no error. Treat step 7 above as mandatory, not optional.
+
+**Two-pass workflow build.** Nodes are created first, links second. Any failure
+during node creation (almost always a missing inventory) aborts the play and
+leaves every node dangling off START. Rebuild with `acm_test_workflow_delete:
+true` after fixing; do not patch a half-built workflow.
+
+**A whitelist without `acm_workflow_name_override` rebuilds the MAIN workflow**
+with only the whitelisted clients, dropping everyone else. Always pair them.
+
+**Node `extra_data` outranks the launch prompt.** Anything pinned into a node
+at generation time cannot be overridden at run time. This is why
+`acm_report_only` is only baked in when explicitly passed to the generator.
+
+**Wildcard and `_acme-challenge` records are skipped** — `*.client…` would
+derive an invalid RFC-1123 secret name.
+
+---
+
+## 11. Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -394,7 +518,7 @@ project. Revert to `master` before production.
 
 ---
 
-## 11. Known gaps / future work
+## 12. Known gaps / future work
 
 1. **Group data-file shape** — the derivation understands one record shape
    (a list of records, each with an FQDN field and an env field). The field
