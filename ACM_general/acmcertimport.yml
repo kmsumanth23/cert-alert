@@ -54,81 +54,18 @@
   tags:
     - certs
 
-# ==================================================================
-# FETCH-ALL MODE (audit) — acm_fetch_all_certs: true
-#
-# Instead of checking only the domains configured for this client
-# (tools.yml `certificates`, or the TX DNS records), scan the WHOLE
-# account/region and report every IMPORTED certificate. Catches certs
-# that nobody is tracking — the class that silently expires.
-#
-# Pass it at workflow launch (or on the JT) exactly like acm_report_only:
-#     acm_fetch_all_certs: true
-#
-# ALWAYS READ-ONLY: these certs have no tools.yml entry, so there is no
-# k8s secret to pull. renewal_due is hardcoded false below, which skips
-# every write step (secret pull, chain verify, ACM import, cleanup) no
-# matter what acm_report_only says.
-#
-# AMAZON_ISSUED certs are excluded: they auto-renew, so listing them is
-# noise. Imported certs are the ones that expire without action.
-# ==================================================================
-- name: Get ALL ACM certificates in the region (fetch-all mode)
-  community.aws.acm_certificate_info:
-    region: "{{ aws_region }}"
-  register: all_acm_certs
-  delegate_to: localhost
-  environment:
-    AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
-    AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
-    AWS_SESSION_TOKEN: "{{ aws_session_token }}"
-  when: acm_fetch_all_certs | default(false) | bool
-  tags:
-    - certs
-
-- name: Show how many certificates were returned (fetch-all mode)
-  debug:
-    msg: >-
-      ACM returned {{ all_acm_certs.certificates | default([]) | length }} cert(s)
-      in {{ aws_region }};
-      {{ all_acm_certs.certificates | default([]) | selectattr('type', 'defined')
-         | selectattr('type', 'equalto', 'IMPORTED') | list | length }} are IMPORTED.
-  when: acm_fetch_all_certs | default(false) | bool
-  tags:
-    - certs
-
-# Keyed by domain, same shape as the normal path, so every downstream task
-# works unchanged. Sorted by expiry DESCENDING so that if two imported certs
-# share a domain, the last write wins = the one expiring SOONEST (the urgent one).
-- name: Build certificate information dictionary (all IMPORTED certs)
-  set_fact:
-    certs_info: "{{ certs_info | default({}) | combine({ c.domain_name: cert_details }) }}"
-  loop: >-
-    {{ all_acm_certs.certificates | default([])
-       | selectattr('type', 'defined') | selectattr('type', 'equalto', 'IMPORTED')
-       | selectattr('not_after', 'defined')
-       | sort(attribute='not_after', reverse=true) }}
-  loop_control:
-    loop_var: c
-    label: "{{ c.domain_name | default('?') }}"
-  vars:
-    cert_details:
-      cert_arn: "{{ c.certificate_arn }}"
-      not_after: "{{ c.not_after }}"
-      expire_ts: "{{ (c.not_after | to_datetime('%Y-%m-%dT%H:%M:%S%z')).timestamp() | int }}"
-      current_ts: "{{ ansible_date_time.epoch | int }}"
-      # Read-only by construction — see the block comment above.
-      renewal_due: false
-      secret_name: ''
-      secret_namespace: ''
-      in_use_by: "{{ c.in_use_by | default([]) }}"
-  when: acm_fetch_all_certs | default(false) | bool
-  tags:
-    - certs
-
 # ------------------------------------------------------------------
-# NORMAL MODE — check only this client's configured domains.
-# Skipped entirely in fetch-all mode.
+# CONFIGURED-CERTIFICATE PATH (the renewal scope)
+#
+# One lookup per domain this client is configured to manage — tools.yml
+# `certificates` for ungrouped clients, or the group's DNS records. These
+# are the ONLY certificates this automation ever renews, and this path is
+# unchanged from v1 apart from no longer being switched off in audit mode.
+#
+# Deliberately NOT replaced by the account-wide sweep below: the sweep
+# filters out certs AWS renews itself, so a configured domain whose ACM
+# cert happens to be AMAZON_ISSUED + ELIGIBLE would drop out of
+# certs_info, be reported as not_found_in_acm, and stop being renewed.
 # ------------------------------------------------------------------
 - name: Get ACM Certificate Details
   community.aws.acm_certificate_info:
@@ -143,7 +80,6 @@
     AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
     AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
     AWS_SESSION_TOKEN: "{{ aws_session_token }}"
-  when: not (acm_fetch_all_certs | default(false) | bool)
   tags:
     - certs
 
@@ -175,10 +111,14 @@
   loop_control:
     label: "{{ item.item.domain_name }}"
   when:
-    - not (acm_fetch_all_certs | default(false) | bool)
     - item.certificates | length > 0
   vars:
     cert_details:
+      # Explicit domain: the sweep below keys its entries by ARN, so report
+      # rows can no longer take the domain from the dict key.
+      domain: "{{ item.item.domain_name }}"
+      # 'automated' = this workflow renews it. The sweep stamps 'manual'.
+      renewal: automated
       cert_arn: "{{ item.certificates[0].certificate_arn }}"
       not_after: "{{ item.certificates[0].not_after }}"
       expire_ts: "{{ (item.certificates[0].not_after | to_datetime('%Y-%m-%dT%H:%M:%S%z')).timestamp() | int }}"
@@ -197,6 +137,139 @@
       # Empty list = attached to nothing, so an expiry there is usually
       # harmless — surfaced as the "In use" column in the digest.
       in_use_by: "{{ item.certificates[0].in_use_by | default([]) }}"
+  tags:
+    - certs
+
+# ==================================================================
+# ACCOUNT-WIDE SWEEP (v2) — ON BY DEFAULT
+#
+# Reports every certificate in the account that AWS will NOT renew by
+# itself, whether or not anyone configured it. Catches the class that
+# silently expires because nobody is tracking it.
+#
+# REPORT SCOPE ONLY. Swept certs get renewal_due: false, so every write
+# step (secret pull, chain verify, ACM import, cleanup) skips them — they
+# have no k8s secret to pull. Renewal scope stays exactly the configured
+# list above.
+#
+# Disable for a debugging run with  acm_fetch_all_certs: false
+#
+# KEYED BY ARN, not by domain: the same domain can exist as separate
+# certificates in several regions (a CloudFront copy in us-east-1 and the
+# client's own region). Keying by domain would collapse them into one row
+# and hide the copy nobody renews. Downstream renewal tasks are all gated
+# on renewal_due, so they never see these keys.
+# ==================================================================
+- name: Resolve sweep regions and status filter
+  set_fact:
+    # The client's own region, plus any extra regions declared in
+    # aws-client-vars-env.yml (e.g. extra_cert_regions: ['us-east-1'] for
+    # clients with CloudFront certs). Deduped so a client already in
+    # us-east-1 is not swept twice.
+    acm_sweep_regions: "{{ ([aws_region] + (extra_cert_regions | default([]))) | unique }}"
+    # PENDING_VALIDATION / FAILED / VALIDATION_TIMED_OUT certs are also
+    # ineligible for renewal, but they were never live — reporting them is
+    # noise. EXPIRED is kept: an expired cert sitting in an account matters.
+    acm_sweep_statuses: "{{ acm_sweep_cert_statuses | default(['ISSUED', 'EXPIRED']) }}"
+  when: acm_fetch_all_certs | default(true) | bool
+  tags:
+    - certs
+
+- name: Get ALL ACM certificates in each swept region
+  community.aws.acm_certificate_info:
+    region: "{{ sweep_region }}"
+  register: acm_sweep_raw
+  delegate_to: localhost
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+    AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+    AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+  loop: "{{ acm_sweep_regions | default([]) }}"
+  loop_control:
+    loop_var: sweep_region
+  when: acm_fetch_all_certs | default(true) | bool
+  tags:
+    - certs
+
+- name: Flatten swept certificates and note what the configured path covered
+  set_fact:
+    acm_swept_certs: >-
+      {{ acm_sweep_raw.results | default([])
+         | selectattr('certificates', 'defined')
+         | map(attribute='certificates') | list | flatten }}
+    acm_configured_arns: "{{ (certs_info | default({})).values() | map(attribute='cert_arn') | list }}"
+    acm_configured_domains: "{{ certs_info | default({}) | list }}"
+    acm_configured_count: "{{ certs_info | default({}) | length }}"
+  when: acm_fetch_all_certs | default(true) | bool
+  tags:
+    - certs
+
+- name: Add swept certificates the configured path did not already cover
+  set_fact:
+    certs_info: "{{ certs_info | default({}) | combine({ c.certificate_arn: sweep_details }) }}"
+  loop: "{{ acm_swept_certs | default([]) }}"
+  loop_control:
+    loop_var: c
+    label: "{{ c.domain_name | default('?') }} ({{ c.status | default('?') }})"
+  when:
+    - acm_fetch_all_certs | default(true) | bool
+    - c.not_after is defined
+    - c.certificate_arn is defined
+    - c.certificate_arn not in (acm_configured_arns | default([]))
+    - (c.status | default('')) in (acm_sweep_statuses | default(['ISSUED', 'EXPIRED']))
+    # Exclude what AWS renews for us. renewal_eligibility is the field the
+    # requirement is actually written against; type == IMPORTED is a proxy
+    # that MISSES amazon-issued certs which have fallen out of managed
+    # renewal. Fall back to the proxy only if the module does not surface
+    # the field at all — a strict test would otherwise drop every cert and
+    # produce a silently empty sweep.
+    - >-
+      (c.renewal_eligibility is defined and c.renewal_eligibility != 'ELIGIBLE')
+      or (c.renewal_eligibility is not defined and (c.type | default('')) == 'IMPORTED')
+  vars:
+    sweep_details:
+      domain: "{{ c.domain_name }}"
+      # 'manual' = ineligible for AWS renewal AND not in our configured
+      # list, so nothing renews it until a human acts.
+      renewal: manual
+      cert_arn: "{{ c.certificate_arn }}"
+      not_after: "{{ c.not_after }}"
+      expire_ts: "{{ (c.not_after | to_datetime('%Y-%m-%dT%H:%M:%S%z')).timestamp() | int }}"
+      current_ts: "{{ ansible_date_time.epoch | int }}"
+      # Read-only by construction — see the block comment above.
+      renewal_due: false
+      secret_name: ''
+      secret_namespace: ''
+      in_use_by: "{{ c.in_use_by | default([]) }}"
+  tags:
+    - certs
+
+# Prints WHY certificates were dropped, so an unexpected count can be
+# explained from the job log without re-running anything. If
+# "carrying renewal_eligibility" is 0, the module is not surfacing the
+# field and the IMPORTED fallback above is what actually filtered.
+- name: Show sweep result
+  debug:
+    msg: >-
+      Sweep across {{ acm_sweep_regions | default([]) | join(', ') }}:
+      {{ swept | length }} cert(s) returned,
+      {{ swept | selectattr('renewal_eligibility', 'defined') | list | length }}
+      carrying renewal_eligibility
+      | excluded: {{ swept | selectattr('renewal_eligibility', 'defined')
+                           | selectattr('renewal_eligibility', 'equalto', 'ELIGIBLE')
+                           | list | length }} AWS-renewed,
+      {{ swept | rejectattr('status', 'defined') | list | length
+         + (swept | selectattr('status', 'defined')
+                  | rejectattr('status', 'in', acm_sweep_statuses | default(['ISSUED', 'EXPIRED']))
+                  | list | length) }} by status,
+      {{ swept | selectattr('certificate_arn', 'defined')
+               | selectattr('certificate_arn', 'in', acm_configured_arns | default([]))
+               | list | length }} already covered by the configured path
+      | configured: {{ acm_configured_count | default(0) }},
+      total rows now: {{ certs_info | default({}) | length }}
+  vars:
+    swept: "{{ acm_swept_certs | default([]) }}"
+  when: acm_fetch_all_certs | default(true) | bool
   tags:
     - certs
 
@@ -563,16 +636,15 @@
 # set_stats artifacts land in the AWX database and job detail UI.
 # ------------------------------------------------------------------
 
-# In fetch-all mode this comparison is meaningless (and misleading): a
-# configured domain whose cert is AMAZON_ISSUED is in ACM, just not imported,
-# so it would be wrongly reported as not_found_in_acm.
+# Compared against the CONFIGURED domains only, never against certs_info as a
+# whole — that now also holds ARN-keyed sweep entries. The v1 fetch-all guard
+# that blanked this list is gone: configured domains are always looked up
+# per-domain, so a miss here is a real miss.
 - name: Note configured domains with no matching certificate in ACM
   set_fact:
     acm_missing_domains: >-
-      {{ []
-         if (acm_fetch_all_certs | default(false) | bool)
-         else (certificates | default([]) | map(attribute='domain_name')
-               | difference(certs_info | default({}) | list)) }}
+      {{ certificates | default([]) | map(attribute='domain_name')
+         | difference(acm_configured_domains | default(certs_info | default({}) | list)) }}
   tags: certs
 
 - name: Build sanitized report rows for consolidated digest
@@ -584,7 +656,12 @@
     label: "{{ cert.key }}"
   vars:
     report_row:
-      domain: "{{ cert.key }}"
+      # Sweep entries are keyed by ARN, so the domain comes from the value.
+      # Falling back to the key keeps older-shaped entries working.
+      domain: "{{ cert.value.domain | default(cert.key, true) }}"
+      # 'automated' (we renew it) / 'manual' (nobody does) — the Renewal
+      # column in the digest email.
+      renewal: "{{ cert.value.renewal | default('automated', true) }}"
       cert_arn: "{{ cert.value.cert_arn }}"
       not_after: "{{ cert.value.not_after }}"
       days_left: "{{ ((cert.value.expire_ts | int) - (ansible_date_time.epoch | int)) // 86400 }}"
@@ -603,6 +680,9 @@
   vars:
     missing_row:
       domain: "{{ missing_domain }}"
+      # A configured domain by definition — it is in our renewal scope, the
+      # certificate is simply absent from ACM.
+      renewal: automated
       cert_arn: ''
       not_after: ''
       days_left: ''
