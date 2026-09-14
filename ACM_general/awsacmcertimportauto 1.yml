@@ -224,11 +224,12 @@
       when: acm_cert_group is defined
       tags: certs
 
+    # v2: unconditional. The account-wide sweep runs by default, so an env
+    # with no configured certificates still has a report to produce — it is
+    # exactly the env most likely to be hiding an untracked cert. The old
+    # gate skipped the include entirely in that case.
     - name: include tasks to import cert to acm
       include_tasks: tasks/aws-cert-import.yml
-      when: >-
-        (certificates | length > 0)
-        or (acm_fetch_all_certs | default(false) | bool)
       tags: certs
 
 #      when: not kubectlcmd.stdout
@@ -256,7 +257,9 @@
           certs: []
       when:
         - certificates | default([]) | length == 0
-        # In fetch-all mode the include above already ran and published a real
-        # report; publishing an empty one here would overwrite it.
-        - not (acm_fetch_all_certs | default(false) | bool)
+        # v2: the include above now always runs and always publishes, so this
+        # fallback only fires when the sweep is explicitly switched off AND
+        # nothing is configured. Publishing here otherwise would overwrite a
+        # real report with an empty one.
+        - not (acm_fetch_all_certs | default(true) | bool)
       tags: certs
