@@ -39,7 +39,14 @@
      11-15 days -> #fff8e1 (yellow)                                          #}
 {% set band_critical = 7 %}
 {% set band_red = 10 %}
-{% macro cert_table(rows, accent) -%}
+{# Console-link settings are resolved HERE, at template top level, and passed
+   INTO the macro as arguments. Do not move these inside the macro: a macro
+   body does not reliably see playbook variables, so aws_console_role read
+   from in there comes back empty and every link silently falls back to the
+   plain console URL. Top level always sees them. #}
+{% set console_portal = aws_console_portal | default('aws-saasmstr', true) %}
+{% set console_role = aws_console_role | default('', true) %}
+{% macro cert_table(rows, accent, console_portal='aws-saasmstr', console_role='') -%}
 <table cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;font-family:Arial,Helvetica,sans-serif;font-size:13px;margin-bottom:24px;">
   <tr style="background:#f0f0f0;">
     <th style="border:1px solid #d0d0d0;padding:6px 10px;text-align:left;">Client / Env</th>
@@ -57,19 +64,48 @@
    else ('#ff9999' if (days is not none and days <= band_critical)
    else ('#fdecea' if (days is not none and days <= band_red)
    else ('#fff8e1' if accent == 'amber' else '#ffffff')))) %}
-{# Region and certificate id both come out of the ARN we already publish:
-   arn:aws:acm:<region>:<account>:certificate/<cert_id>
-   so no extra artifact field is needed. The domain cell is left as plain
-   text on purpose — mail clients auto-linkify hostnames and would fight an
-   anchor of ours — and the console link hangs off the region line instead. #}
+{# Region, ACCOUNT and certificate id all come out of the ARN we already
+   publish — arn:aws:acm:<region>:<account>:certificate/<cert_id> — so no
+   extra artifact field is needed. The domain cell is left as plain text on
+   purpose (mail clients auto-linkify hostnames and would fight an anchor of
+   ours); the console link hangs off the line beneath instead.
+
+   WHY THE ACCOUNT ID IS SHOWN: a plain console URL carries NO account
+   context. It opens in whichever account the reader's browser session is
+   already signed into, so with many accounts every link lands in the same
+   one and reports "certificate not found".
+
+   LINK FORM: when aws_console_role is set, the link goes through the IAM
+   Identity Center access portal, which switches to the account named in the
+   ARN and then lands on the certificate. Without it the link is the plain
+   console URL (wrong account, but the account id beside it tells the reader
+   which one to switch to). Set in aws-client-vars-base.yml:
+
+     aws_console_role: <permission set name, e.g. AdministratorAccess>
+     aws_console_portal: aws-saasmstr        # default, override if it moves
+
+   aws_console_role is a PERMISSION SET name, not the full IAM role. Readers
+   who do not hold that permission set in that account land on the portal
+   rather than the certificate — a soft failure, not a broken link.
+
+   console_portal / console_role arrive as MACRO ARGUMENTS — see the note
+   above the macro definition for why they are not read here. #}
 {% set arn = row.cert_arn | default('', true) | string %}
 {% set arn_parts = arn.split(':') %}
 {% set cert_region = arn_parts[3] if (arn_parts | length) > 5 else '' %}
+{% set cert_account = arn_parts[4] if (arn_parts | length) > 5 else '' %}
 {% set cert_id = arn.split('/')[-1] if '/' in arn else '' %}
   <tr style="background:{{ row_bg }};">
     <td style="border:1px solid #d0d0d0;padding:6px 10px;white-space:nowrap;">{{ row.client }} / {{ row.env }}</td>
     <td style="border:1px solid #d0d0d0;padding:6px 10px;">{{ row.domain }}
-{%- if cert_region | length > 0 and cert_id | length > 0 %}<br/><a href="https://{{ cert_region }}.console.aws.amazon.com/acm/certificates/{{ cert_id }}" style="font-size:11px;color:#5b5bd6;text-decoration:none;">{{ cert_region }} &middot; {{ cert_id[:8] }} &#8599;</a>{% endif %}</td>
+{%- if cert_region | length > 0 and cert_id | length > 0 %}
+{%- set console_url = 'https://' ~ cert_region ~ '.console.aws.amazon.com/acm/certificates/' ~ cert_id -%}
+{%- if console_role | length > 0 and cert_account | length > 0 -%}
+{%- set cert_link = 'https://' ~ console_portal ~ '.awsapps.com/start/#/console?account_id=' ~ cert_account ~ '&amp;role_name=' ~ console_role ~ '&amp;destination=' ~ (console_url | urlencode) -%}
+{%- else -%}
+{%- set cert_link = console_url -%}
+{%- endif -%}
+<br/><a href="{{ cert_link }}" style="font-size:11px;color:#5b5bd6;text-decoration:none;">{{ cert_region }} &middot; {{ cert_account }} &middot; {{ cert_id[:8] }} &#8599;</a>{% endif %}</td>
     <td style="border:1px solid #d0d0d0;padding:6px 10px;">{{ row.not_after | default('-', true) }}</td>
     <td style="border:1px solid #d0d0d0;padding:6px 10px;text-align:right;{% if days is not none and days <= band_critical %}color:#b71c1c;font-weight:bold;{% endif %}">{{ days if days is not none else '-' }}</td>
 {# in_use: 'yes' / 'no' / '-' . Older artifacts (jobs still on the previous
@@ -105,17 +141,17 @@
 {% if failed_rows | length > 0 %}
   <h3 style="color:#b71c1c;margin:0 0 8px 0;">&#10060; Failures &mdash; manual action required</h3>
   <p style="font-size:12px;color:#555;margin:0 0 8px 0;">Import failures and chain-verification failures also triggered immediate individual alerts.</p>
-  {{ cert_table(failed_rows, 'red') }}
+  {{ cert_table(failed_rows, 'red', console_portal, console_role) }}
 {% endif %}
 
 {% if expiring_rows | length > 0 %}
   <h3 style="color:#8a6d00;margin:0 0 8px 0;">&#9200; Expiring within {{ digest_expiry_days }} days (not yet renewed)</h3>
-  {{ cert_table(expiring_rows | sort(attribute='days_left') , 'amber') }}
+  {{ cert_table(expiring_rows | sort(attribute='days_left'), 'amber', console_portal, console_role) }}
 {% endif %}
 
 {% if renewed_rows | length > 0 %}
   <h3 style="color:#1b5e20;margin:0 0 8px 0;">&#9989; Renewed in this run</h3>
-  {{ cert_table(renewed_rows, 'green') }}
+  {{ cert_table(renewed_rows, 'green', console_portal, console_role) }}
 {% endif %}
 
 {% if missing_reports | length > 0 %}
