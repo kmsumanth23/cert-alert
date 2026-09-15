@@ -64,6 +64,84 @@
         branch_report: "{{ lookup('vars', report_key, default={}) }}"
         branch_rows: "{{ branch_report.certs | default([]) | map('combine', {'client': expected.client, 'env': expected.env}) | list }}"
 
+    # ------------------------------------------------------------------
+    # ARN DEDUPE
+    #
+    # One ACM certificate can be shared by several client environments in
+    # the same account — renewing it once fixes all of them. Each env
+    # publishes its own artifact, so without this it appears once per env,
+    # inflating every count and making the report look like more work than
+    # there is.
+    #
+    # Runs BEFORE classification so a collapsed row lands in exactly one
+    # bucket. Deduping afterwards could put the same certificate in both
+    # failed_rows and expiring_rows.
+    # ------------------------------------------------------------------
+    - name: Stamp a dedupe key on every collected row
+      set_fact:
+        digest_certs_keyed: "{{ digest_certs_keyed | default([]) + [row | combine({'dedupe_key': dkey}) ] }}"
+      loop: "{{ digest_certs }}"
+      loop_control:
+        loop_var: row
+        label: "{{ row.client }}/{{ row.env }}/{{ row.domain | default('?') }}"
+      vars:
+        # not_found_in_acm rows have no ARN, and a domain missing in two
+        # different accounts is two real findings — key those per client-env
+        # so they never collapse into one another.
+        dkey: >-
+          {{ row.cert_arn
+             if ((row.cert_arn | default('', true) | length) > 0)
+             else (row.client ~ '|' ~ row.env ~ '|' ~ (row.domain | default(''))) }}
+
+    - name: Collapse rows that share a certificate
+      set_fact:
+        digest_certs_merged: "{{ digest_certs_merged | default([]) + [grp[0] | combine(merged_fields)] }}"
+      loop: "{{ digest_certs_keyed | default([]) | map(attribute='dedupe_key') | unique | list }}"
+      loop_control:
+        loop_var: dedupe_key
+        label: "{{ dedupe_key }}"
+      vars:
+        grp: "{{ digest_certs_keyed | selectattr('dedupe_key', 'equalto', dedupe_key) | list }}"
+        statuses: "{{ grp | map(attribute='status') | list }}"
+        merged_fields:
+          # WORST status wins. If one env failed to import and another saw the
+          # cert as merely expiring, the row must show the failure — a merge
+          # must never hide a problem reported by one of its sources.
+          status: >-
+            {{ 'import_failed' if 'import_failed' in statuses
+               else ('chain_verify_failed' if 'chain_verify_failed' in statuses
+               else ('not_found_in_acm' if 'not_found_in_acm' in statuses
+               else ('expired' if 'expired' in statuses
+               else ('renewed' if 'renewed' in statuses
+               else (statuses | first | default('ok', true)))))) }}
+          # First non-empty error across the sources, so the failure reason
+          # survives the merge.
+          error: "{{ grp | selectattr('error', 'defined') | map(attribute='error') | select() | first | default('', true) }}"
+          # Rendered by the template's Client / Env column. One client is the
+          # common case and reads as 'hxtx / np, prd'; the multi-client form
+          # keeps each pair intact.
+          client_env_label: >-
+            {%- set clients = grp | map(attribute='client') | unique | list -%}
+            {%- if clients | length == 1 -%}
+            {{ clients[0] }} / {{ grp | map(attribute='env') | unique | list | join(', ') }}
+            {%- else -%}
+            {%- set pairs = [] -%}
+            {%- for g in grp -%}
+            {%-   set _ = pairs.append(g.client ~ ' / ' ~ g.env) -%}
+            {%- endfor -%}
+            {{ pairs | unique | list | join(' · ') }}
+            {%- endif -%}
+
+    - name: Replace the collected rows with the collapsed set
+      set_fact:
+        digest_certs: "{{ digest_certs_merged | default([]) }}"
+        # Counted against digest_certs_keyed, NOT digest_certs — the latter is
+        # being reassigned by this same task and the evaluation order of
+        # set_fact keys is not guaranteed.
+        # Shown in the email header and the summary line, and the cheapest way
+        # to confirm the dedupe actually did something in a given run.
+        digest_duplicates_collapsed: "{{ (digest_certs_keyed | default([]) | length) - (digest_certs_merged | default([]) | length) }}"
+
     - name: Classify failed and renewed certificates
       set_fact:
         failed_rows: "{{ digest_certs | selectattr('status', 'in', ['import_failed', 'chain_verify_failed', 'not_found_in_acm']) | list }}"
@@ -92,8 +170,9 @@
           {{ digest_expiry_days }} days, {{ renewed_rows | length }} renewed,
           {{ failed_rows | length }} failed,
           {{ missing_reports | length }} client-env(s) with no report,
-          {{ digest_certs | length }} certs scanned across
-          {{ expected_reports | length }} client-env(s).
+          {{ digest_certs | length }} distinct cert(s) across
+          {{ expected_reports | length }} client-env(s)
+          ({{ digest_duplicates_collapsed | default(0) }} duplicate row(s) collapsed).
 
     - name: Nothing to report — end without sending email
       meta: end_play
