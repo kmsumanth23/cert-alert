@@ -96,7 +96,10 @@
 {% set cert_account = arn_parts[4] if (arn_parts | length) > 5 else '' %}
 {% set cert_id = arn.split('/')[-1] if '/' in arn else '' %}
   <tr style="background:{{ row_bg }};">
-    <td style="border:1px solid #d0d0d0;padding:6px 10px;white-space:nowrap;">{{ row.client }} / {{ row.env }}</td>
+{# client_env_label is set by the digest's ARN dedupe and lists every client
+   environment sharing one certificate ('hxtx / np, prd'). Falls back to the
+   single pair so rows from an older artifact still render. #}
+    <td style="border:1px solid #d0d0d0;padding:6px 10px;white-space:nowrap;">{{ row.client_env_label | default(row.client ~ ' / ' ~ row.env, true) }}</td>
     <td style="border:1px solid #d0d0d0;padding:6px 10px;">{{ row.domain }}
 {%- if cert_region | length > 0 and cert_id | length > 0 %}
 {%- set console_url = 'https://' ~ cert_region ~ '.console.aws.amazon.com/acm/certificates/' ~ cert_id -%}
@@ -127,8 +130,11 @@
   <h2 style="margin:0 0 4px 0;">ACM Certificate Digest &mdash; {{ '%Y-%m-%d' | strftime }}</h2>
   <p style="margin:0 0 16px 0;color:#555;font-size:13px;">
     Consolidated daily report across {{ expected_reports | length }} client environment(s)
-    &middot; {{ digest_certs | length }} certificate(s) scanned
+    &middot; {{ digest_certs | length }} distinct certificate(s) scanned
     &middot; expiry window: {{ digest_expiry_days }} days
+{%- if (digest_duplicates_collapsed | default(0) | int) > 0 %}
+    &middot; {{ digest_duplicates_collapsed }} duplicate row(s) collapsed
+{%- endif %}
   </p>
 
   <p style="font-size:14px;margin:0 0 20px 0;">
