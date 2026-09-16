@@ -1,0 +1,144 @@
+---
+# aws-v9-automation/tasks/acm-verify-job.yml
+#
+# Per-client-env verification. Replaces groups A, B, C and E of the manual
+# checklist by asserting the invariants inside the job that can see them.
+#
+# INERT unless switched on. Add to the workflow launch:
+#     acm_verify: true
+# Run it read-only the first time:
+#     acm_verify: true, acm_report_only: true
+#
+# Include at the very END of tasks/aws-cert-import.yml, after the
+# "Publish consolidated digest artifact" task:
+#
+#     - name: Verify this job's certificate handling
+#       include_tasks: tasks/acm-verify-job.yml
+#       when: acm_verify | default(false) | bool
+#       tags: certs
+
+- name: Collect verification facts
+  set_fact:
+    # Swept certs carrying ACM's renewal_eligibility field. If this is 0 while
+    # certs were returned, the collection is NOT surfacing the field and the
+    # IMPORTED fallback did the filtering — which silently hides exactly the
+    # AMAZON_ISSUED + INELIGIBLE certs the sweep exists to find.
+    acmv_elig_present: "{{ acm_swept_certs | default([]) | selectattr('renewal_eligibility', 'defined') | list | length }}"
+    acmv_swept_total: "{{ acm_swept_certs | default([]) | length }}"
+    # Any swept ('manual') certificate marked renewable would mean the sweep
+    # can write. It has no k8s secret to pull, so this must always be empty.
+    # Built with an explicit loop and | bool so a string 'False' cannot pass.
+    acmv_manual_renewable: >-
+      {%- set bad = [] -%}
+      {%- for k, v in (certs_info | default({})).items() -%}
+      {%-   if (v.renewal | default('')) == 'manual' and (v.renewal_due | default(false) | bool) -%}
+      {%-     set _ = bad.append(v.domain | default(k)) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ bad }}
+    # Report rows missing a field v2 is supposed to publish.
+    acmv_rows_missing_fields: >-
+      {%- set bad = [] -%}
+      {%- for r in (acm_report_rows | default([])) -%}
+      {%-   if ('renewal' not in r) or ('cert_arn' not in r) or ('domain' not in r) -%}
+      {%-     set _ = bad.append(r.domain | default('?')) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ bad }}
+    # Every configured domain must end up either as a row or on the
+    # not-found list. Anything in neither was dropped silently.
+    acmv_unaccounted: >-
+      {%- set reported = [] -%}
+      {%- for r in (acm_report_rows | default([])) -%}
+      {%-   set _ = reported.append(r.domain | default('')) -%}
+      {%- endfor -%}
+      {%- set bad = [] -%}
+      {%- for c in (certificates | default([])) -%}
+      {%-   if c.domain_name not in reported
+             and c.domain_name not in (acm_missing_domains | default([])) -%}
+      {%-     set _ = bad.append(c.domain_name) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ bad }}
+  tags: certs
+
+- name: 'VERIFY J1 — the configured-certificate path ran'
+  assert:
+    that:
+      - cert_facts is defined
+    fail_msg: >-
+      cert_facts is undefined: "Get ACM Certificate Details" did not run, so
+      the renewal scope is dead. A leftover `when: not acm_fetch_all_certs`
+      gate is the usual cause.
+    success_msg: "Configured path ran ({{ certificates | default([]) | length }} domain(s) configured)."
+  tags: certs
+
+- name: 'VERIFY J2 — the account-wide sweep ran'
+  assert:
+    that:
+      - acm_sweep_regions is defined
+      - acm_sweep_regions | length > 0
+    fail_msg: >-
+      Sweep regions were never resolved. acm_fetch_all_certs should default to
+      true in v2 — check it was not left at the v1 default of false.
+    success_msg: "Swept {{ acm_sweep_regions | join(', ') }}."
+  when: acm_fetch_all_certs | default(true) | bool
+  tags: certs
+
+- name: 'VERIFY J3 — ACM is returning renewal_eligibility'
+  assert:
+    that:
+      - (acmv_swept_total | int) == 0 or (acmv_elig_present | int) > 0
+    fail_msg: >-
+      {{ acmv_swept_total }} certificate(s) were swept and NONE carries
+      renewal_eligibility. The filter fell back to type == IMPORTED, so
+      AMAZON_ISSUED certificates that have dropped out of managed renewal are
+      still invisible — the exact gap v2 was built to close. The report will
+      look correct. Raise this rather than passing the run.
+    success_msg: "{{ acmv_elig_present }}/{{ acmv_swept_total }} swept cert(s) carry renewal_eligibility."
+  when: acm_fetch_all_certs | default(true) | bool
+  tags: certs
+
+- name: 'VERIFY J4 — no swept certificate can be renewed'
+  assert:
+    that:
+      - acmv_manual_renewable | length == 0
+    fail_msg: >-
+      These swept certificates are marked renewal_due: {{ acmv_manual_renewable }}.
+      They have no k8s secret behind them, so the job would attempt to renew a
+      certificate nobody owns. STOP the run.
+    success_msg: "No swept certificate is renewable."
+  tags: certs
+
+- name: 'VERIFY J5 — report rows carry the v2 fields'
+  assert:
+    that:
+      - acmv_rows_missing_fields | length == 0
+    fail_msg: >-
+      Rows missing renewal/cert_arn/domain: {{ acmv_rows_missing_fields }}.
+      The digest cannot render the Renewal column or the console link without
+      them — usually an older tasks/aws-cert-import.yml on this branch.
+    success_msg: "All {{ acm_report_rows | default([]) | length }} row(s) carry the v2 fields."
+  tags: certs
+
+- name: 'VERIFY J6 — every configured domain is accounted for'
+  assert:
+    that:
+      - acmv_unaccounted | length == 0
+    fail_msg: >-
+      Configured domains that are neither reported nor listed as
+      not_found_in_acm: {{ acmv_unaccounted }}. They were dropped silently.
+    success_msg: "All configured domains are reported or flagged not_found_in_acm."
+  tags: certs
+
+- name: 'VERIFY — job summary'
+  debug:
+    msg: >-
+      {{ acm_report_client | default(client_code) }}/{{ acm_report_env | default(client_env) }}:
+      {{ certificates | default([]) | length }} configured,
+      {{ acmv_swept_total }} swept,
+      {{ acm_report_rows | default([]) | length }} row(s) published
+      ({{ (acm_report_rows | default([])) | selectattr('renewal', 'defined')
+          | selectattr('renewal', 'equalto', 'manual') | list | length }} manual),
+      {{ acm_missing_domains | default([]) | length }} not found in ACM.
+  tags: certs

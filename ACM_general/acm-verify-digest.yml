@@ -1,0 +1,164 @@
+---
+# aws-v9-automation/tasks/acm-verify-digest.yml
+#
+# Aggregate verification. Replaces groups D and F of the manual checklist plus
+# the dedupe checks, by asserting on the merged rows the digest has just built.
+#
+# INERT unless switched on:  acm_verify: true  at workflow launch.
+#
+# Include in acm-cert-digest.yml AFTER "Replace the collected rows with the
+# collapsed set" and BEFORE the mail task:
+#
+#     - name: Verify the consolidated digest
+#       include_tasks: tasks/acm-verify-digest.yml
+#       when: acm_verify | default(false) | bool
+
+- name: Collect digest verification facts
+  set_fact:
+    # Rows the dedupe never labelled. Every merged row gets client_env_label,
+    # so a gap here means the collapse step did not run over everything.
+    acmv_unlabelled: >-
+      {%- set bad = [] -%}
+      {%- for r in (digest_certs | default([])) -%}
+      {%-   if (r.client_env_label | default('') | length) == 0 -%}
+      {%-     set _ = bad.append((r.client | default('?')) ~ '/' ~ (r.env | default('?'))) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ bad }}
+    # Same certificate AND same status still present twice: the dedupe missed
+    # a pair. (Same ARN with DIFFERENT statuses is correct and expected — that
+    # is the a,b renewed / c failed case.)
+    acmv_dupes_left: >-
+      {%- set seen = [] -%}
+      {%- set dup = [] -%}
+      {%- for r in (digest_certs | default([])) -%}
+      {%-   if (r.cert_arn | default('') | length) > 0 -%}
+      {%-     set k = r.cert_arn ~ '|' ~ (r.status | default('')) -%}
+      {%-     if k in seen -%}
+      {%-       set _ = dup.append((r.domain | default('?')) ~ ' [' ~ (r.status | default('')) ~ ']') -%}
+      {%-     else -%}
+      {%-       set _ = seen.append(k) -%}
+      {%-     endif -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ dup | unique | list }}
+    # A 'manual' certificate is one nothing in this automation renews, so it
+    # can never legitimately carry a renewal outcome.
+    acmv_manual_with_outcome: >-
+      {%- set bad = [] -%}
+      {%- for r in (digest_certs | default([])) -%}
+      {%-   if (r.renewal | default('')) == 'manual'
+             and (r.status | default('')) in ['renewed', 'import_failed', 'chain_verify_failed'] -%}
+      {%-     set _ = bad.append((r.domain | default('?')) ~ ' [' ~ r.status ~ ']') -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ bad }}
+    # days_left must be numeric wherever it is populated, or the expiry
+    # comparison silently degrades to a string compare.
+    acmv_bad_days: >-
+      {%- set bad = [] -%}
+      {%- for r in (digest_certs | default([])) -%}
+      {%-   set d = r.days_left | default('', true) | string -%}
+      {%-   if d | length > 0 and not (d | regex_search('^-?[0-9]+$')) -%}
+      {%-     set _ = bad.append((r.domain | default('?')) ~ '=' ~ d) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ bad }}
+    # Every expected client-env must have either reported or be listed as
+    # missing. Neither means the manifest and the artifacts disagree.
+    acmv_unaccounted_envs: >-
+      {%- set reported = [] -%}
+      {%- for r in (digest_certs | default([])) -%}
+      {%-   set _ = reported.append((r.client | default('')) ~ '/' ~ (r.env | default(''))) -%}
+      {%- endfor -%}
+      {%- set missing = [] -%}
+      {%- for m in (missing_reports | default([])) -%}
+      {%-   set _ = missing.append(m.client ~ '/' ~ m.env) -%}
+      {%- endfor -%}
+      {%- set bad = [] -%}
+      {%- for e in (expected_reports | default([])) -%}
+      {%-   set key = e.client ~ '/' ~ e.env -%}
+      {%-   if key not in missing and key not in reported
+             and not (digest_certs | default([]) | selectattr('client_env_label', 'defined')
+                      | selectattr('client_env_label', 'search', e.env) | list | length > 0) -%}
+      {%-     set _ = bad.append(key) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ bad }}
+
+- name: 'VERIFY D1 — dedupe ran over every row'
+  assert:
+    that:
+      - acmv_unlabelled | length == 0
+    fail_msg: >-
+      Rows with no client_env_label: {{ acmv_unlabelled }}. The collapse step
+      did not cover them, so the Client / Env column falls back to a single
+      pair and shared certificates will still appear more than once.
+    success_msg: "All {{ digest_certs | default([]) | length }} row(s) labelled; {{ digest_duplicates_collapsed | default(0) }} duplicate(s) collapsed."
+
+- name: 'VERIFY D2 — no duplicate certificate/status pairs remain'
+  assert:
+    that:
+      - acmv_dupes_left | length == 0
+    fail_msg: >-
+      These certificate/status pairs still appear more than once:
+      {{ acmv_dupes_left }}. The dedupe key is not collapsing them.
+    success_msg: "No duplicate certificate/status pairs remain."
+
+- name: 'VERIFY D3 — buckets are consistent with row status'
+  assert:
+    that:
+      - (failed_rows | rejectattr('status', 'in', ['import_failed', 'chain_verify_failed', 'not_found_in_acm']) | list | length) == 0
+      - (expiring_rows | selectattr('status', 'in', ['import_failed', 'chain_verify_failed', 'not_found_in_acm', 'renewed']) | list | length) == 0
+    fail_msg: >-
+      A row is in a bucket that does not match its status. Most likely the
+      dedupe moved relative to the classification tasks — it must run BEFORE
+      them, or one certificate can land in two buckets.
+    success_msg: "Failed/expiring/renewed buckets match their row statuses."
+
+- name: 'VERIFY D4 — no manual certificate carries a renewal outcome'
+  assert:
+    that:
+      - acmv_manual_with_outcome | length == 0
+    fail_msg: >-
+      Sweep-discovered certificates showing a renewal outcome:
+      {{ acmv_manual_with_outcome }}. Nothing renews a 'manual' certificate,
+      so either the renewal flag or the write guard is wrong.
+    success_msg: "No manual certificate carries a renewal outcome."
+
+- name: 'VERIFY D5 — days_left is numeric'
+  assert:
+    that:
+      - acmv_bad_days | length == 0
+    fail_msg: "Non-numeric days_left: {{ acmv_bad_days }}. The expiry comparison would degrade to a string compare."
+    success_msg: "days_left is numeric on every populated row."
+
+- name: 'VERIFY D6 — every expected client-env is accounted for'
+  assert:
+    that:
+      - acmv_unaccounted_envs | length == 0
+    fail_msg: >-
+      Client-envs that neither reported nor appear as missing:
+      {{ acmv_unaccounted_envs }}. expected_reports and the artifacts disagree.
+    success_msg: "All {{ expected_reports | length }} expected client-env(s) accounted for."
+
+# Configuration state rather than correctness — reported, never fatal, so a
+# verification run does not fail on something that is deliberate today.
+- name: 'VERIFY — configuration warnings'
+  debug:
+    msg: >-
+      {{ warnings if (warnings | length) > 0 else 'none' }}
+  vars:
+    warnings: >-
+      {%- set w = [] -%}
+      {%- if (digest_expiry_days | int) != 15 -%}
+      {%-   set _ = w.append('digest_expiry_days is ' ~ digest_expiry_days ~ ', not 15 — revert before go-live') -%}
+      {%- endif -%}
+      {%- if (aws_console_role | default('') | length) == 0 -%}
+      {%-   set _ = w.append('aws_console_role unset — console links fall back to the plain URL and open in the wrong account') -%}
+      {%- endif -%}
+      {%- if (digest_certs | default([]) | selectattr('renewal', 'defined')
+              | selectattr('renewal', 'equalto', 'manual') | list | length) == 0 -%}
+      {%-   set _ = w.append('no manual (sweep-only) certificates in the report — either genuinely none expiring, or the sweep found nothing') -%}
+      {%- endif -%}
+      {{ w }}
