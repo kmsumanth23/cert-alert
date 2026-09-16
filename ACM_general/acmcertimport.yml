@@ -162,11 +162,23 @@
 # ==================================================================
 - name: Resolve sweep regions and status filter
   set_fact:
-    # The client's own region, plus any extra regions declared in
-    # aws-client-vars-env.yml (e.g. extra_cert_regions: ['us-east-1'] for
-    # clients with CloudFront certs). Deduped so a client already in
-    # us-east-1 is not swept twice.
-    acm_sweep_regions: "{{ ([aws_region] + (extra_cert_regions | default([]))) | unique }}"
+    # The client's own region, plus the CDN region when this client-env holds
+    # CloudFront certificates:
+    #
+    #   aws-client-vars-env.yml   cdn_certs_enabled: true    (per client-env)
+    #   aws-client-vars-base.yml  cdn_cert_region: us-east-1 (org-wide default)
+    #
+    # AWS REQUIRES CloudFront certificates to live in that one region, so the
+    # flag is a statement about the CLIENT ("has CDN certs"), not about where
+    # to look. The region itself is still data rather than a literal here, so
+    # nothing in the playbook has to change if it ever moves.
+    #
+    # Deduped, so a client whose own region IS the CDN region is not swept
+    # twice.
+    acm_sweep_regions: >-
+      {{ ([aws_region]
+          + ([cdn_cert_region | default('us-east-1', true)]
+             if (cdn_certs_enabled | default(false) | bool) else [])) | unique }}
     # PENDING_VALIDATION / FAILED / VALIDATION_TIMED_OUT certs are also
     # ineligible for renewal, but they were never live — reporting them is
     # noise. EXPIRED is kept: an expired cert sitting in an account matters.
