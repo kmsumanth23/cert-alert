@@ -85,13 +85,22 @@
         loop_var: row
         label: "{{ row.client }}/{{ row.env }}/{{ row.domain | default('?') }}"
       vars:
+        # KEY = certificate + STATUS, not certificate alone. Dedupe collapses
+        # identical noise (one cert reported the same way by several envs).
+        # When outcomes DIFFER that is signal, and collapsing destroys it: if
+        # envs a and b renewed the cert and c failed chain verification, a
+        # cert-only key produces ONE row claiming all three failed, and the
+        # successful renewal vanishes from the report. With status in the key,
+        # a+b collapse into a Renewed row and c stands alone in Failures.
+        #
         # not_found_in_acm rows have no ARN, and a domain missing in two
         # different accounts is two real findings — key those per client-env
         # so they never collapse into one another.
         dkey: >-
-          {{ row.cert_arn
+          {{ (row.cert_arn ~ '|' ~ (row.status | default('')))
              if ((row.cert_arn | default('', true) | length) > 0)
-             else (row.client ~ '|' ~ row.env ~ '|' ~ (row.domain | default(''))) }}
+             else (row.client ~ '|' ~ row.env ~ '|' ~ (row.domain | default(''))
+                   ~ '|' ~ (row.status | default(''))) }}
 
     - name: Collapse rows that share a certificate
       set_fact:
@@ -117,6 +126,27 @@
           # First non-empty error across the sources, so the failure reason
           # survives the merge.
           error: "{{ grp | selectattr('error', 'defined') | map(attribute='error') | select() | first | default('', true) }}"
+          # If ANY source env has the domain configured, this automation does
+          # renew the certificate. Taking the first source's value could label
+          # it Manual and send someone to do work that is already handled —
+          # happens when one env has it in tools.yml and another only sees it
+          # through the account-wide sweep.
+          renewal: >-
+            {{ 'automated'
+               if ('automated' in (grp | selectattr('renewal', 'defined')
+                                       | map(attribute='renewal') | list))
+               else (grp[0].renewal | default('', true)) }}
+          # Envs of one client run sequentially, so if np renews the cert,
+          # prd's later lookup sees the NEW expiry — two different day counts
+          # for one ARN. Take the lowest; never understate urgency.
+          days_left: >-
+            {%- set nums = [] -%}
+            {%- for g in grp -%}
+            {%-   if (g.days_left | default('', true) | string | length) > 0 -%}
+            {%-     set _ = nums.append(g.days_left | int) -%}
+            {%-   endif -%}
+            {%- endfor -%}
+            {{ nums | min if (nums | length) > 0 else (grp[0].days_left | default('', true)) }}
           # Rendered by the template's Client / Env column. One client is the
           # common case and reads as 'hxtx / np, prd'; the multi-client form
           # keeps each pair intact.
@@ -141,6 +171,12 @@
         # Shown in the email header and the summary line, and the cheapest way
         # to confirm the dedupe actually did something in a given run.
         digest_duplicates_collapsed: "{{ (digest_certs_keyed | default([]) | length) - (digest_certs_merged | default([]) | length) }}"
+
+    # Optional aggregate verification. Inert unless acm_verify: true is passed
+    # at workflow launch. Runs after the collapse so it sees the merged rows.
+    - name: Verify the consolidated digest
+      include_tasks: tasks/acm-verify-digest.yml
+      when: acm_verify | default(false) | bool
 
     - name: Classify failed and renewed certificates
       set_fact:
