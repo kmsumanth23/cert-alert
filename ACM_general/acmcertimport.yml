@@ -446,7 +446,9 @@
     sender: "{{ smtp_default_sender }}"
     to: "{{ cert_alert_recipients }}"
     cc: "{{ cloudops_group_emails }}"
-    subject: "Error!!! {{ item }} chain verification failed - ACM import skipped"
+    # Client/env in the subject: one certificate can be shared by several
+    # client environments, so the domain alone does not say which job failed.
+    subject: "Error!!! [{{ acm_report_client | default(client_code) }}/{{ acm_report_env | default(client_env) }}] {{ item }} chain verification failed - ACM import skipped"
     body: >-
       Local OpenSSL chain verification failed for {{ item }} before ACM
       import. The import has been skipped to avoid pushing a broken
@@ -570,7 +572,7 @@
     sender: "{{ smtp_default_sender }}"
     to: "{{ cert_alert_recipients }}"
     cc: "{{ cloudops_group_emails }}"
-    subject: "Error!!! {{ item.key }} import failed"
+    subject: "Error!!! [{{ acm_report_client | default(client_code) }}/{{ acm_report_env | default(client_env) }}] {{ item.key }} import failed"
     body: "{{ lookup('template', 'manual_cert_mail_content.txt.j2') }}"
   loop: "{{ certs_info | dict2items }}"
   loop_control:
@@ -712,4 +714,11 @@
       collected_at: "{{ ansible_date_time.iso8601 }}"
       renewal_threshold_days: "{{ client_cert_expiry_notice }}"
       certs: "{{ acm_report_rows | default([]) }}"
+  tags: certs
+
+# Optional post-run verification. Inert unless acm_verify: true is passed at
+# workflow launch. See tasks/acm-verify-job.yml.
+- name: Verify this job's certificate handling
+  include_tasks: tasks/acm-verify-job.yml
+  when: acm_verify | default(false) | bool
   tags: certs
