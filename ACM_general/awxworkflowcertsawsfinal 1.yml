@@ -24,17 +24,6 @@
     # Group mode is ON whenever a group name is supplied. The value IS the
     # group key in client_parent — no group name appears anywhere in code.
     acm_group_mode: "{{ acm_cert_group is defined and (acm_cert_group | length > 0) }}"
-    # SINGLE-CLIENT SHORTHAND — acm_client_workflow: <client>
-    #
-    # Builds a workflow for ONE ordinary client. It sets the scope AND the
-    # workflow name together, which is the whole point: passing
-    # acm_cert_env_whitelist on its own rebuilds the MAIN workflow containing
-    # only that client and silently drops everyone else. This var cannot be
-    # half-used.
-    #
-    # An explicit acm_cert_env_whitelist or acm_workflow_name_override still
-    # wins, so the manual form keeps working unchanged.
-    acm_single_client: "{{ acm_client_workflow | default('', true) }}"
 
 # Step 0 (group mode only) — resolve the group's configuration from the central
 # mapping: gcp-shared-services/playbooks/awx/kube/common/vars/client-mapping.yml
@@ -85,23 +74,6 @@
 
 # Resolve every group-derived name and path ONCE, so no consumer rebuilds
 # them. Each falls back: explicit extra var -> group mapping entry -> default.
-- name: Resolve the effective client whitelist
-  set_fact:
-    # Explicit whitelist wins; otherwise the single-client shorthand supplies
-    # one; otherwise empty, which means "no whitelist" to every consumer.
-    acm_env_whitelist_resolved: >-
-      {{ acm_cert_env_whitelist
-         | default([acm_single_client] if ((acm_single_client | length) > 0) else [], true) }}
-
-- name: Assert single-client and group mode are not combined
-  assert:
-    that:
-      - not ((acm_single_client | length > 0) and (acm_group_mode | bool))
-    fail_msg: >-
-      acm_client_workflow and acm_cert_group are mutually exclusive —
-      acm_client_workflow builds a workflow for one ordinary client, group
-      mode builds one for a whole group from client-mapping.yml. Pass one.
-
 - name: Resolve workflow, schedule and job-template names
   set_fact:
     acm_group_jt_name: >-
@@ -112,14 +84,36 @@
       {{ acm_schedule_override
          | default((acm_group_cfg | default({})).schedule
                    | default('Runs daily certs', true), true) }}
+    # NAME RESOLUTION — the order here is a safety property, not a preference.
+    #
+    # A whitelist DERIVES its own name, ranked above the group name and above
+    # the mapping's workflow_name. Scoping a run can therefore never land on
+    # the name of a production workflow: passing a whitelist alone used to
+    # rebuild "all clients" containing only those clients and silently drop
+    # everyone else, and with acm_test_workflow_delete it deleted main first.
+    #
+    # The derived name is SORTED and '/' becomes '-', so the same scope always
+    # produces the same name whatever order it was typed in — otherwise
+    # ["mosa","hxtx"] and ["hxtx","mosa"] would build two workflows for one
+    # scope. Long whitelists give long names; that is deliberate, because a
+    # truncated name would let two different scopes collide and overwrite
+    # each other.
+    #
+    #   1. acm_workflow_name_override          explicit always wins
+    #   2. derived from acm_cert_env_whitelist any scoped run
+    #   3. <group>.workflow_name               from client-mapping.yml
+    #   4. derived from acm_cert_group         group mode
+    #   5. 'renew certs - aws - all clients'   main, reachable ONLY unscoped
     acm_group_workflow_name: >-
       {{ acm_workflow_name_override
-         | default((acm_group_cfg | default({})).workflow_name
-                   | default(('renew certs - aws - ' ~ acm_cert_group ~ ' clients')
-                             if (acm_group_mode | bool)
-                             else (('renew certs - aws - ' ~ acm_single_client ~ ' clients')
-                                   if ((acm_single_client | length) > 0)
-                                   else 'renew certs - aws - all clients'), true), true) }}
+         | default(('renew certs - aws - scoped: '
+                    ~ (acm_cert_env_whitelist | default([], true) | sort
+                       | map('regex_replace', '/', '-') | join(', ')))
+                   if ((acm_cert_env_whitelist | default([], true) | length) > 0)
+                   else ((acm_group_cfg | default({})).workflow_name
+                         | default(('renew certs - aws - ' ~ acm_cert_group ~ ' clients')
+                                   if (acm_group_mode | bool)
+                                   else 'renew certs - aws - all clients', true)), true) }}
 
 # Group data paths. Resolved inside the JOB's checkout, so git_project must be
 # a submodule of aws-v9-automation. Empty in main mode — nothing reads them.
@@ -196,7 +190,7 @@
     - >-
       (refresh_cert | bool)
       or ((acm_test_ignore_refresh_flag | default(false) | bool)
-          and ((acm_env_whitelist_resolved | length) > 0))
+          and ((acm_cert_env_whitelist | default([], true) | length) > 0))
       or ((acm_group_mode | default(false) | bool)
           and (awx_client_code in acm_group_clients))
 
@@ -213,9 +207,9 @@
     # clients. To build a SEPARATE workflow, ALSO pass acm_workflow_name_override
     # (Step 4) — otherwise you shrink the main production workflow.
     - >-
-      ((acm_env_whitelist_resolved | length) == 0)
-      or (env.path in acm_env_whitelist_resolved)
-      or (awx_client_code in acm_env_whitelist_resolved)
+      ((acm_cert_env_whitelist | default([], true) | length) == 0)
+      or (env.path in (acm_cert_env_whitelist | default([], true)))
+      or (awx_client_code in (acm_cert_env_whitelist | default([], true)))
 
     # GROUP MODE: keep ONLY that group's clients. In normal (main) mode,
     # optionally SUBTRACT every grouped client so a stray refresh_certs: true
