@@ -106,10 +106,12 @@ Four things change that set:
 | `acm_cert_group: <g>` | **group mode** — take that group's `clients` list from `client-mapping.yml` and bypass `refresh_certs` for them (group membership *is* their opt-in) |
 | `acm_cert_env_whitelist` | narrow to listed clients (`"hxtx"`) or envs (`"hxtx/np"`) |
 | `acm_test_ignore_refresh_flag` | let whitelisted envs in without the flag (test towers; inert without a whitelist) |
-| `acm_client_workflow: <client>` | **one ordinary client** — sets the scope *and* the workflow name together (§5) |
 
-> ⚠️ A whitelist **without** `acm_workflow_name_override` rebuilds the **main**
-> workflow containing only those clients, dropping everyone else.
+> A whitelist now **derives its own workflow name** (`renew certs - aws -
+> scoped: hxtx, mosa`), so a scoped run can no longer land on a production
+> workflow's name. Pass `acm_workflow_name_override` only when you want a
+> specific name. The derived name is sorted, so the same scope always produces
+> the same workflow whatever order you typed the clients in.
 
 ---
 
@@ -123,9 +125,7 @@ Builds the AWX workflow object. Runs once per generation, not per client.
 | **Load the central client mapping** | Reads `client_parent` from `common/vars/client-mapping.yml`, or uses it if the init playbook already loaded it. Group mode only. |
 | **Resolve configuration for cert group** | Picks `client_parent[<group>]` — its `clients`, `git_project`, and optional overrides. |
 | **Assert the cert group resolved** | Fails loudly, listing the known groups, if the key is missing. Stops a typo producing an empty workflow. |
-| **Resolve the effective client whitelist** | Explicit `acm_cert_env_whitelist` wins; otherwise `acm_client_workflow` supplies one; otherwise empty, which every consumer reads as "no whitelist". |
-| **Assert single-client and group mode are not combined** | `acm_client_workflow` and `acm_cert_group` answer the same question two ways; passing both is rejected rather than silently resolved. |
-| **Resolve workflow, schedule and job-template names** | Three-level fallback each: explicit override var → mapping entry → default. This is why a group can have its own JT, workflow name or schedule with no code change. |
+| **Resolve workflow, schedule and job-template names** | Each name falls back explicit override → mapping entry → default, so a group can have its own JT or schedule with no code change. The **workflow name** has one extra rung, and its order is a safety property: override → **derived from the whitelist** → mapping's `workflow_name` → derived from the group → `all clients`. Because a whitelist outranks every production name, a scoped run cannot overwrite main or a group workflow — and `acm_test_workflow_delete` deletes the scoped one, since delete and create read the same variable. |
 | **Resolve group data-file paths** | Builds the path to the group's records file inside the **job's** checkout — so `git_project` must be a submodule of `aws-v9-automation`. |
 | **Default group data-file paths in main mode** | Blanks them; nothing reads them outside group mode. |
 | **Print resolved cert group configuration** | One line with every resolved value. **First thing to read when a group build looks wrong.** |
@@ -372,9 +372,8 @@ green, the Client/Env column is merged, and a console link opens the right
 | Var | Effect |
 |---|---|
 | `acm_cert_group: <g>` | build that group's workflow; the value **is** the key in `client-mapping.yml` |
-| `acm_cert_env_whitelist` | narrow scope — `"hxtx"` or `"hxtx/np"` |
-| `acm_client_workflow: <client>` | build a workflow for ONE ordinary client — sets scope and name together. Use this rather than a bare whitelist: a whitelist alone rebuilds **main** with only that client |
-| `acm_workflow_name_override` | build a separate workflow object |
+| `acm_cert_env_whitelist` | narrow scope — `["hxtx"]`, `["hxtx","mosa"]` or `["hxtx/np"]`. Builds its own `scoped:` workflow, leaving main and the group workflows untouched |
+| `acm_workflow_name_override` | name the workflow explicitly; outranks everything, including the whitelist-derived name |
 | `acm_schedule_override`, `acm_job_template_override`, `acm_digest_inventory` | name overrides |
 | `acm_test_ignore_refresh_flag` | whitelisted envs bypass `refresh_certs` |
 | `acm_test_workflow_delete` | delete before rebuild (clean rebuild) |
