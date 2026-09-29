@@ -532,6 +532,80 @@
     - item.rc is defined
   tags: certs
 
+# ------------------------------------------------------------------
+# RE-READ RENEWED CERTIFICATES
+#
+# expire_ts was taken from the ACM lookup that ran BEFORE the import, so a
+# successfully renewed certificate still carried the OLD expiry all the way
+# into the report — the Renewed bucket showed the days left on the cert we
+# just replaced.
+#
+# Queried BY ARN, not domain: we imported to that exact ARN, and a domain
+# lookup can return several certificates.
+#
+# Placed before "Mark certificates as expiring soon or expired" so the expiry
+# re-check sees the new values.
+# ------------------------------------------------------------------
+- name: Re-read renewed certificates from ACM
+  community.aws.acm_certificate_info:
+    certificate_arn: "{{ certs_info[item].cert_arn }}"
+    region: "{{ aws_region }}"
+  register: renewed_cert_facts
+  delegate_to: localhost
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+    AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+    AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+  loop: "{{ certs_info.keys() | list }}"
+  loop_control:
+    loop_var: item
+    label: "{{ certs_info[item].domain | default(item) }}"
+  when: (certs_info[item].status | default('')) == 'renewed'
+  tags:
+    - certs
+
+- name: Update expiry for renewed certificates
+  set_fact:
+    certs_info: >-
+      {{ certs_info | combine({
+          item.item: certs_info[item.item] | combine({
+            'not_after': new_not_after,
+            'expire_ts': new_expire_ts,
+            'renewal_expiry_unchanged': (new_expire_ts | int) == (certs_info[item.item].expire_ts | int)
+          })
+      }) }}
+  loop: "{{ renewed_cert_facts.results | default([]) }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.item | default('?') }}"
+  vars:
+    new_not_after: "{{ (item.certificates | default([]))[0].not_after | default('', true) }}"
+    new_expire_ts: "{{ (new_not_after | to_datetime('%Y-%m-%dT%H:%M:%S%z')).timestamp() | int }}"
+  when:
+    - item.item is defined
+    - (item.certificates | default([]) | length) > 0
+    - ((item.certificates[0].not_after | default('', true)) | length) > 0
+  tags: certs
+
+# A cert reported 'renewed' whose ACM expiry did not move means the import
+# returned rc 0 but did not take effect. Silent today; surfaced here and
+# asserted by VERIFY J7.
+- name: Warn if a renewed certificate still shows its old expiry in ACM
+  debug:
+    msg: >-
+      WARNING: {{ certs_info[item].domain | default(item) }} was reported
+      renewed, but ACM still returns the pre-import expiry
+      ({{ certs_info[item].not_after }}). The import reported success without
+      taking effect — verify in the ACM console before trusting this report.
+  loop: "{{ certs_info.keys() | list }}"
+  loop_control:
+    loop_var: item
+    label: "{{ certs_info[item].domain | default(item) }}"
+  when:
+    - (certs_info[item].status | default('')) == 'renewed'
+    - certs_info[item].renewal_expiry_unchanged | default(false) | bool
+  tags: certs
+
 # Certs that failed chain verification are skipped by the import task (gated on chain_verify_failed).
 # Set status explicitly here or they silently fall through to 'expiring_soon'.
 - name: Set status for certificates that failed chain verification
