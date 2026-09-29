@@ -106,6 +106,7 @@ Four things change that set:
 | `acm_cert_group: <g>` | **group mode** — take that group's `clients` list from `client-mapping.yml` and bypass `refresh_certs` for them (group membership *is* their opt-in) |
 | `acm_cert_env_whitelist` | narrow to listed clients (`"hxtx"`) or envs (`"hxtx/np"`) |
 | `acm_test_ignore_refresh_flag` | let whitelisted envs in without the flag (test towers; inert without a whitelist) |
+| `acm_client_workflow: <client>` | **one ordinary client** — sets the scope *and* the workflow name together (§5) |
 
 > ⚠️ A whitelist **without** `acm_workflow_name_override` rebuilds the **main**
 > workflow containing only those clients, dropping everyone else.
@@ -122,6 +123,8 @@ Builds the AWX workflow object. Runs once per generation, not per client.
 | **Load the central client mapping** | Reads `client_parent` from `common/vars/client-mapping.yml`, or uses it if the init playbook already loaded it. Group mode only. |
 | **Resolve configuration for cert group** | Picks `client_parent[<group>]` — its `clients`, `git_project`, and optional overrides. |
 | **Assert the cert group resolved** | Fails loudly, listing the known groups, if the key is missing. Stops a typo producing an empty workflow. |
+| **Resolve the effective client whitelist** | Explicit `acm_cert_env_whitelist` wins; otherwise `acm_client_workflow` supplies one; otherwise empty, which every consumer reads as "no whitelist". |
+| **Assert single-client and group mode are not combined** | `acm_client_workflow` and `acm_cert_group` answer the same question two ways; passing both is rejected rather than silently resolved. |
 | **Resolve workflow, schedule and job-template names** | Three-level fallback each: explicit override var → mapping entry → default. This is why a group can have its own JT, workflow name or schedule with no code change. |
 | **Resolve group data-file paths** | Builds the path to the group's records file inside the **job's** checkout — so `git_project` must be a submodule of `aws-v9-automation`. |
 | **Default group data-file paths in main mode** | Blanks them; nothing reads them outside group mode. |
@@ -227,6 +230,9 @@ The heart of the system. Runs once per client-env.
 | Task | What it does |
 |---|---|
 | **Set certificate status** | `renewed` / `import_failed`. ⚠️ Requires `item.rc is defined` — without that guard, skipped items fall through to a default and label **every** certificate `expiring_soon`. |
+| **Re-read renewed certificates from ACM** | After a successful import the certificate in ACM has a **new** expiry, but `expire_ts` still held the value read *before* the import — so the Renewed bucket reported the days left on the certificate we had just replaced. Queried **by ARN**, since we imported to that exact ARN and a domain lookup can return several certificates. |
+| **Update expiry for renewed certificates** | Writes the new `not_after` / `expire_ts`, and records `renewal_expiry_unchanged` when the expiry did not move. |
+| **Warn if a renewed certificate still shows its old expiry in ACM** | An import that returned rc 0 without taking effect. Silent before; asserted by VERIFY J7. |
 | **Set status for certificates that failed chain verification** | Stamps `chain_verify_failed` explicitly; the import task skipped them, so otherwise they fall through. |
 | **Mark certificates as expiring soon or expired** | For everything not already carrying a renewal outcome: `expired` if past, else `expiring_soon` if inside `client_cert_expiry_notice`. |
 | **Notify immediately on import failure** | **Immediate email**, per certificate, `[client/env]` in the subject. |
@@ -321,6 +327,7 @@ checklist**. Run read-only the first time:
 | J4 | a swept cert marked renewable → would attempt to renew a cert with no secret behind it. **Stop the run.** |
 | J5 | report rows missing v2 fields → stale engine on that branch |
 | J6 | a configured domain reported nowhere and not flagged not-found |
+| J7 | a cert reported `renewed` whose ACM expiry did not move — the import reported success without taking effect |
 
 **`tasks/acm-verify-digest.yml`** — aggregate:
 
@@ -366,6 +373,7 @@ green, the Client/Env column is merged, and a console link opens the right
 |---|---|
 | `acm_cert_group: <g>` | build that group's workflow; the value **is** the key in `client-mapping.yml` |
 | `acm_cert_env_whitelist` | narrow scope — `"hxtx"` or `"hxtx/np"` |
+| `acm_client_workflow: <client>` | build a workflow for ONE ordinary client — sets scope and name together. Use this rather than a bare whitelist: a whitelist alone rebuilds **main** with only that client |
 | `acm_workflow_name_override` | build a separate workflow object |
 | `acm_schedule_override`, `acm_job_template_override`, `acm_digest_inventory` | name overrides |
 | `acm_test_ignore_refresh_flag` | whitelisted envs bypass `refresh_certs` |
@@ -538,4 +546,11 @@ green, the Client/Env column is merged, and a console link opens the right
    to the expiry window before the dedupe rather than after.
 7. **The `+11h` constant** in the expiry maths is unexplained — document or
    remove it.
-8. **Renewal eligibility column** deferred to v3.
+8. **A literal "renewal eligibility" column** would carry no information today.
+   Every row in the report is already filtered to
+   `renewal_eligibility != 'ELIGIBLE'`, so such a column would read
+   `INELIGIBLE` on every line. The eligibility distinction is expressed by the
+   filter, and the **Renewal** column carries the more actionable question on
+   top of it — *does this automation renew it?* (`Automated`) or *does nobody?*
+   (`Manual`). A column only becomes meaningful if the report is ever widened
+   to include AWS-managed certificates.
