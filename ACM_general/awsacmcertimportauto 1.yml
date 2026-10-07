@@ -140,6 +140,22 @@
       set_fact:
         cert_group_vars: "{{ cert_group_vars_raw }}"
       vars:
+        # SHIMS for variables the cert-vars file references but the CERT job
+        # does not define. They exist only so the lazy render succeeds; the
+        # values are the real ones, so the file's own dns_file_path resolves
+        # to the same path the generator built.
+        #
+        # 'repo' and 'dns_config_project' are the SAME thing — the DNS config
+        # repo directory — spelled differently in different versions of
+        # cloud-cert-vars.yml. Both are shimmed because which one you meet
+        # depends on the BRANCH the job checks out, which the cert job does
+        # not control. A group tested on one branch can fail on another.
+        #
+        # ADDING A SHIM: run this against the cert-vars file on the branch the
+        # job ACTUALLY runs, not the one you tested against:
+        #     grep -o '{{[^}]*}}' <cert_vars_file> | sort -u
+        # Only base_src, client_code and client_env are already in scope here.
+        repo: "{{ acm_group_git_project | default('', true) }}"
         dns_config_project: "{{ acm_group_git_project | default('', true) }}"
         awx_env: "{{ acm_group_dns_env | default('prod', true) }}"
       when: acm_cert_group is defined
