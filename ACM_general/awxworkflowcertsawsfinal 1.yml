@@ -272,12 +272,12 @@
       {%-     else -%}
       {%-       set next_ident = 'renew-cert-' ~ client_env_entry.client ~ '-' ~ env_list[loop.index].env -%}
       {%-     endif -%}
+      {%-     set ticket = tickets.get(client_env_entry.client, {}).get(client_env_entry.infra_code, '') -%}
       {%-     set node = {
                 'identifier': 'renew-cert-' ~ client_env_entry.client ~ '-' ~ client_env_entry.env,
                 'inventory': 'inventory_client_' ~ client_env_entry.client ~ '_' ~ client_env_entry.env,
                 'unified_job_template': {'name': acm_group_jt_name, 'type': 'job_template'},
                 'extra_data': {
-                  'prod_ticket': tickets.get(client_env_entry.client, {}).get(client_env_entry.infra_code, ''),
                   'infra_code': client_env_entry.infra_code,
                   'now_cloud': 'aws',
                   'acm_report_client': client_env_entry.client,
@@ -285,6 +285,22 @@
                 },
                 'related': {'always_nodes': [next_ident]}
               } -%}
+      {#-     prod_ticket is injected ONLY when awx_renew_certs_tickets actually
+              holds one for this client/infra_code.
+
+              Node extra_data lands as job EXTRA VARS — the highest precedence
+              in Ansible, above set_fact and include_vars. Injecting it
+              unconditionally meant an empty string here silently overrode
+              whatever tasks/client-vars-include.yml resolved, so any client
+              with is_prod: true failed trying to fetch its prod ticket while
+              non-prod clients never noticed, because nothing reads it.
+
+              Omitting the key leaves the play's own resolution intact. When a
+              ticket IS mapped, behaviour is exactly as before. -#}
+      {%-     if ticket | length > 0 -%}
+      {%-       set node = node | combine({'extra_data':
+                  node.extra_data | combine({'prod_ticket': ticket}) }) -%}
+      {%-     endif -%}
       {#-     GROUP MODE: acm_cert_group tells the job to source `certificates`
               from the group's repo instead of tools.yml, and selects the
               group's alert recipients. NOTE: acm_report_only is deliberately
